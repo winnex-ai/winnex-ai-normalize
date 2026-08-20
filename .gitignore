@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+*.key
+*.token
+*api_key*
+credentials/
+secrets/
+
+# --- Internal ---
+internal/
+*ANALISE*
+*ESTUDO*
+*PROMPT*

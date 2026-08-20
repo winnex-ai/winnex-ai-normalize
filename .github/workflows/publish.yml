@@ -1,0 +1,68 @@
+name: publish
+
+# Publish winnex-ai-normalize to PyPI using a Trusted Publisher (OpenID Connect).
+# This is the credential-free mechanism recommended by PyPI — no API token
+# in the repository. The PyPI-side configuration must match EXACTLY:
+#
+#   PyPI Project Name : winnex-ai-normalize
+#   Owner             : winnex-ai
+#   Repository name   : winnex-ai-normalize
+#   Workflow name     : publish.yml
+#   Environment name  : publish
+#
+# winnex-ai-normalize is pure Python (no C++ extension), so the build runs
+# directly on ubuntu-latest (no manylinux container needed).
+
+on:
+  push:
+    tags:
+      - "v*"          # v1.0.0, v1.0.1, ... trigger a release
+  workflow_dispatch:  # allow manual trigger from the Actions tab
+
+permissions:
+  contents: read
+  id-token: write    # required for the trusted-publisher OIDC exchange
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --quiet --upgrade pip build
+          python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the Environment name registered on the PyPI trusted
+    # publisher (currently: "publish"). Create this environment under
+    # GitHub → Settings → Environments → New environment.
+    environment: publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
