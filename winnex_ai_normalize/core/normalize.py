@@ -121,8 +121,10 @@ class EmbeddingNormalizer:
     @property
     def embedding_service(self):
         if self._embedding_service is None:
-            from .embedding import get_embedding_service
-            self._embedding_service = get_embedding_service()
+            from .embedding import EmbeddingService
+            # Use THIS normalizer's config (not the env singleton) so a caller
+            # can point at a specific provider/service.
+            self._embedding_service = EmbeddingService(config=self.config)
         return self._embedding_service
 
     def vectorize_texts(self, texts, dim=None) -> np.ndarray:
@@ -132,6 +134,10 @@ class EmbeddingNormalizer:
         """
         dim = dim or self.config.default_dim
         return self.embedding_service.embed_texts(texts, dim=dim)
+
+    def embed_one(self, text: str) -> np.ndarray:
+        """Embed a single text → (d,) float32 (query path)."""
+        return self.embedding_service.embed_one(text)
 
     def normalize_vectors(
         self,

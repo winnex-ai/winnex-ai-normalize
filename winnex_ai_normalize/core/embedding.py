@@ -12,6 +12,7 @@ Provider failover: the providers are tried in `config.provider_order`
 (lowest priority first); if one fails, the next is tried. If ALL fail,
 a RuntimeError is raised with the collected errors.
 """
+import json
 import logging
 import os
 import threading
@@ -48,7 +49,7 @@ class EmbeddingProvider:
 
     def embed(self, texts: List[str]) -> np.ndarray:
         """Embed a list of texts → (n, d) float32 L2-normalized."""
-        result = self._post("/embeddings", {"model": self.model, "input": texts})
+        result = self._post("/v1/embeddings", {"model": self.model, "input": texts})
         data = sorted(result.get("data", []), key=lambda x: x.get("index", 0))
         if not data:
             raise RuntimeError(f"provider {self.name}: empty embeddings response")
@@ -62,7 +63,7 @@ class EmbeddingProvider:
 
     def check_available(self) -> dict:
         try:
-            r = self._post("/embeddings", {"model": self.model, "input": ["health-check"]})
+            r = self._post("/v1/embeddings", {"model": self.model, "input": ["health-check"]})
             return {"available": bool(r.get("data")), "provider": self.name,
                     "model": self.model, "base_url": self.base_url}
         except Exception as e:
@@ -157,10 +158,41 @@ class EmbeddingService:
 
 # Singleton for reuse
 _service = None
+_service_registry_sig = None   # fingerprint of the registry used to build _service
+
+
+def _registry_signature(registry) -> str:
+    """Fingerprint of the registered providers (priority + base_url + model).
+    Used to detect registry changes without reading secrets."""
+    try:
+        provs = registry.list()
+        return json.dumps(
+            [(p.get("base_url", ""), p.get("model", ""), p.get("priority", 0))
+             for p in provs], sort_keys=True)
+    except Exception:
+        return ""
 
 
 def get_embedding_service() -> EmbeddingService:
-    global _service
-    if _service is None:
-        _service = EmbeddingService()
+    """Return the embedding service, rebuilt when the provider registry changes.
+
+    If the secure provider registry has registered providers, the service is
+    built from the registry config (the admin-registered failover order). If
+    providers are added/removed via the API, the service is rebuilt on the
+    next call.
+    """
+    global _service, _service_registry_sig
+    try:
+        from .provider_registry import get_registry
+        registry = get_registry()
+        sig = _registry_signature(registry)
+    except Exception:
+        registry, sig = None, None
+
+    if _service is None or (sig is not None and sig != _service_registry_sig):
+        if registry is not None and sig and registry.list():
+            _service = EmbeddingService(config=registry.to_config())
+        else:
+            _service = EmbeddingService()
+        _service_registry_sig = sig
     return _service

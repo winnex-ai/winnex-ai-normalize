@@ -1,0 +1,26 @@
+# winnex-ai-normalize — test compose.
+# Builds the normalizer image and exposes the OpenAI-compatible API.
+# The embedding provider (bge-m3 local on the host :8102) is reachable via
+# host.docker.internal (Linux: add_host).
+services:
+  normalize:
+    build: .
+    container_name: winnex-ai-normalize
+    ports:
+      - "8103:8102"
+    environment:
+      WINNEX_AI_NORMALIZE_ADMIN_KEY: change-me-in-production
+      WINNEX_AI_NORMALIZE_PROVIDERS_FILE: /var/lib/winnex-ai-normalize/providers.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - normalize-providers:/var/lib/winnex-ai-normalize
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8102/v1/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  normalize-providers:
