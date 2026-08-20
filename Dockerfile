@@ -5,7 +5,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # The package is installed from PyPI (the image just runs the API).
-RUN pip install --no-cache-dir winnex-ai-normalize[all]
+RUN pip install --no-cache-dir --force-reinstall "winnex-ai-normalize[all]==1.0.1"
 
 # Provider registry persistence (mounted as a volume in production).
 ENV WINNEX_AI_NORMALIZE_PROVIDERS_FILE=/var/lib/winnex-ai-normalize/providers.json
