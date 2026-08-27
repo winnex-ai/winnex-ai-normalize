@@ -76,6 +76,12 @@ class EmbeddingService:
     Tries the providers in `config.provider_order`; the first that succeeds
     serves the batch. If ALL fail, raises RuntimeError with the collected
     errors (NO silent fallback to fake vectors).
+
+    Embedding-set drift tracking: the service fingerprints every batch
+    (provider, dim, centroid) and compares each new batch against the last.
+    A provider switch (failover) or a drifted space is flagged — mixing
+    embedding sets from different spaces corrupts semantic recall while the
+    motor keeps reporting 0 bound violations.
     """
 
     def __init__(self, config=None, provider_factory=EmbeddingProvider):
@@ -86,6 +92,9 @@ class EmbeddingService:
         }
         self._cache: dict[str, np.ndarray] = {}
         self._lock = threading.Lock()
+        self._fingerprint: Optional["EmbeddingFingerprint"] = None
+        self._last_drift_flags: list = []
+        self.current_provider: Optional[str] = None
 
     def _cache_put(self, text: str, vec: np.ndarray) -> None:
         with self._lock:
@@ -102,7 +111,9 @@ class EmbeddingService:
             if not p or not p.__dict__.get("_available", True):
                 continue
             try:
-                return p.embed(texts)
+                vecs = p.embed(texts)
+                self.current_provider = name  # record who served this batch
+                return vecs
             except Exception as e:
                 errors.append(f"{name}: {str(e)[:120]}")
                 logger.warning(f"provider {name} failed: {e}")
@@ -133,7 +144,40 @@ class EmbeddingService:
                 self._cache_put(texts[i], v)
         with self._lock:
             vecs = np.stack([self._cache[t] for t in texts]).astype(np.float32)
+        # Embedding-set drift tracking: fingerprint the batch and compare with
+        # the previous one. A provider switch or a drifted space is a WARN/FAIL
+        # flag — surfaced on the batch (last_drift_flags) and via audit_corpus.
+        self._track_batch(vecs)
         return np.ascontiguousarray(vecs, dtype=np.float32)
+
+    def _track_batch(self, vecs: np.ndarray) -> None:
+        """Fingerprint this batch and check drift against the last one.
+
+        The fingerprint is a provider + centroid + norm summary — cheap to
+        compute, deterministic for the same batch. Cross-provider switches are
+        flagged (different vector spaces, incomparable similarities); dimension
+        shifts are a hard FAIL; a same-provider centroid cosine drop is
+        WARN/FAIL drift.
+        """
+        try:
+            from .quality import (EmbeddingFingerprint, check_embedding_drift,
+                                  QualityConfig, logger as qlogger)
+            if len(vecs) == 0:
+                return
+            fp = EmbeddingFingerprint(
+                provider=self.current_provider or "",
+                dim=int(vecs.shape[1]),
+                centroid=vecs.mean(axis=0),
+                norm_mean=float(np.linalg.norm(vecs, axis=1).mean()),
+            )
+            flags = check_embedding_drift(self._fingerprint, fp, QualityConfig())
+            if flags:
+                self._last_drift_flags = flags
+                for f in flags:
+                    qlogger.warning("embedding drift: %s", f.message)
+            self._fingerprint = fp
+        except Exception as e:  # pragma: no cover — never break the embed path
+            logger.debug(f"drift tracking skipped: {e}")
 
     def embed_one(self, text: str) -> np.ndarray:
         """Embed a single text → (d,) float32."""

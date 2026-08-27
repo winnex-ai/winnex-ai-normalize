@@ -7,12 +7,23 @@ provider failover and NO silent fallback to fake vectors.
 
 Components:
     - core.config:      JSON-driven provider/config (model, dim, failover order)
-    - core.embedding:   EmbeddingService with provider failover + cache
+    - core.embedding:   EmbeddingService with provider failover + cache + drift tracking
     - core.normalize:   validate / L2-normalize / quantize → Madhava corpus
-    - api.server:       OpenAI-compatible /v1/embeddings endpoint
+    - core.quality:     quality FLAGS — the MOTOR's own Cauchy-Schwarz proof,
+                        launched on seed queries and captured as the excluded
+                        seed set (the flag response) + engine-config routing
+    - api.server:       OpenAI-compatible /v1/embeddings + /v1/quality/validate
 
 Consumed by: winnex-madhava (direct), winnex-tracer, the Liferay bridges,
 and the Maestro — any tool that needs to feed vectors to Madhava.
+
+The quality gate protects end-to-end recall from the stages OUTSIDE the motor:
+third-party embedding quality, dataset integrity (e.g. the corrupted BIGANN
+base), and the prefilter/basis routing. The VALIDATION IS THE ENGINE'S OWN:
+Cauchy-Schwarz UB < threshold ⟹ the document is mathematically proven not in
+the top-K. The validator launches that proof on seed queries and captures the
+excluded set — the captured set IS the flag response. FLAGS: pass / warn /
+fail.
 
 Business Source License 1.1 (BSL 1.1) | pay@winnex.ai
 """
@@ -24,8 +35,19 @@ from .core.normalize import (
     normalize_l2,
     quantize_corpus,
 )
+from .core.quality import (
+    QualityConfig,
+    QualityGateError,
+    QualityReport,
+    QualityValidator,
+    Flag,
+    EmbeddingFingerprint,
+    audit_corpus,
+    build_quality_engine,
+    check_embedding_drift,
+)
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 __all__ = [
     "NormalizeConfig",
@@ -38,5 +60,15 @@ __all__ = [
     "validate_embeddings",
     "normalize_l2",
     "quantize_corpus",
+    # quality flags
+    "QualityConfig",
+    "QualityGateError",
+    "QualityReport",
+    "QualityValidator",
+    "Flag",
+    "EmbeddingFingerprint",
+    "audit_corpus",
+    "build_quality_engine",
+    "check_embedding_drift",
     "__version__",
 ]

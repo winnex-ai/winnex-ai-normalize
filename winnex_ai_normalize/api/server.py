@@ -140,6 +140,7 @@ def health():
     cfg = load_config()
     svc = get_embedding_service()
     status = svc.check_available()
+    drift = getattr(svc, "_last_drift_flags", None) or []
     return {
         "status": "ok" if status.get("available") else "degraded",
         "service": "winnex-ai-normalize",
@@ -147,6 +148,56 @@ def health():
         "default_provider": cfg.default_provider,
         "provider_order": cfg.provider_order,
         "providers": status,
+        "embedding_drift_flags": [f.message for f in drift],
+    }
+
+
+class ValidateRequest(BaseModel):
+    """Quality-gate request: validate an embedding set / raw-vector corpus."""
+    vectors: List[List[float]]      # (n, d) — embedding set or uint8-byte corpus
+    dim: Optional[int] = None
+    provider: str = ""
+    reference: Optional[List[List[float]]] = None  # compare against another set
+    dtype: str = "float32"          # "float32" | "uint8"
+
+
+@app.post("/v1/quality/validate")
+def validate_embeddings_endpoint(req: ValidateRequest):
+    """Validate a corpus/embedding set and return the quality report.
+
+    This is the ingest gate that protects end-to-end recall from the stages
+    OUTSIDE the Madhava motor: embedding quality (third-party providers),
+    dataset integrity (the corrupted-BIGANN class), and the prefilter routing.
+
+    FAIL flags → HTTP 422 with the full report. Use `allow_unsafe=true` only
+    when you intend to index anyway.
+    """
+    import numpy as np
+    from winnex_ai_normalize.core.quality import audit_corpus
+
+    arr = np.array(req.vectors, dtype=np.float32 if req.dtype == "float32" else np.uint8)
+    ref = None
+    if req.reference is not None:
+        ref = np.array(req.reference, dtype=np.float32)
+    report = audit_corpus(arr, dim=req.dim or None, reference=ref,
+                          provider=req.provider or None)
+    payload = report.to_dict()
+    if report.has_fail:
+        raise HTTPException(422, payload)
+    return payload
+
+
+@app.get("/v1/quality/health")
+def quality_health():
+    """Return the current embedding-drift flags (the service-level health)."""
+    svc = get_embedding_service()
+    return {
+        "status": "ok" if not getattr(svc, "_last_drift_flags", None) else "warn",
+        "embedding_drift_flags": [
+            f.to_dict() if hasattr(f, "to_dict") else {"message": str(f)}
+            for f in getattr(svc, "_last_drift_flags", None) or []
+        ],
+        "current_provider": getattr(svc, "current_provider", None),
     }
 
 

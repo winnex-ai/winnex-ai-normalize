@@ -111,7 +111,14 @@ def quantize_corpus(embeddings: np.ndarray) -> np.ndarray:
 # The normalizer facade (text/vectors → ready-for-madhava)
 # ---------------------------------------------------------------------------
 class EmbeddingNormalizer:
-    """Normalizes text or raw vectors into Madhava-ready float32/uint8."""
+    """Normalizes text or raw vectors into Madhava-ready float32/uint8.
+
+    The normalizer is ALSO the quality guardian: every corpus that passes
+    through it is audited (dataset integrity + embedding-set drift), and the
+    audit FLAGS + routes the engine configuration. This is the ingest gate
+    that protects end-to-end recall from third-party embedding drift and
+    corrupted datasets (e.g. the BIGANN base whose order differs from the GT).
+    """
 
     def __init__(self, config=None, embedding_service=None):
         from .config import load_config
@@ -170,23 +177,52 @@ class EmbeddingNormalizer:
         engine's build_float32 manifold preserves cosine). The madhava
         engine stays agnostic — it receives ready float32 vectors.
 
+        The corpus is AUDITED first (quality flags): corrupted datasets
+        (NaN, degenerate, alignment) FAIL loudly; isotropic/redundant corpora
+        route to a safer k1_fraction; dim ≥ 384 forces early_exit=False (the
+        P0 recall bug). Pass `allow_unsafe=True` to skip the gate.
+
         Args:
             vectors: (n, d) float32 embeddings (or text via vectorize_texts).
             dim: embedding dimension.
             k: top-k.
             **engine_kwargs: passed to winnex_madhava.build_engine.
         Returns:
-            a winnex_madhava engine.
+            a winnex_madhava engine (or (engine, QualityReport) when
+            return_report=True).
         """
-        import winnex_madhava as wm
+        from .quality import build_quality_engine
         arr = self.normalize_vectors(vectors, dim=dim)
-        return wm.build_engine(
+        return build_quality_engine(
             np.ascontiguousarray(arr, dtype=np.float32),
             dim=dim or arr.shape[1],
-            metric="cosine",
             k=k,
-            normalize_input=True,
-            **engine_kwargs,
+            provider=getattr(self.embedding_service, "current_provider", None),
+            engine_kwargs=dict(metric="cosine", normalize_input=True, **engine_kwargs),
+        )
+
+    def audit_corpus(self, vectors, dim=None, reference=None) -> "QualityReport":
+        """Validate a corpus/embedding set and return a QualityReport.
+
+        This is the explicit quality gate: inspect a dataset BEFORE indexing
+        it (the BIGANN-class problem — corrupted order, NaN, degenerate,
+        isotropic, redundant, drifted-vs-reference) and get the FLAGS + the
+        suggested engine configuration.
+
+        Args:
+            vectors: (n, d) embeddings (float32/float64) or uint8 raw bytes.
+            dim: expected dimension (mismatch → FAIL flag).
+            reference: an embedding batch to compare against (drift /
+                alignment — the "multiple embedding sets" case).
+        Returns:
+            QualityReport (flags, metrics, suggested config).
+        """
+        from .quality import audit_corpus
+        return audit_corpus(
+            vectors,
+            dim=dim,
+            reference=reference,
+            provider=getattr(self.embedding_service, "current_provider", None),
         )
 
     def check_available(self) -> dict:
