@@ -239,3 +239,89 @@ def test_real_arxiv_audit():
     # the captured exclusions are mathematically sound: UB < threshold
     for rec in rep2.excluded_seed_set[:20]:
         assert rec["upper_bound"] <= rec["threshold"] + 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 / GAIA: embedding-quality floor (query resolution + golden set)
+# ---------------------------------------------------------------------------
+
+def _blurry_corpus(n=2000, d=128, seed=1):
+    """A 'blurry photo' corpus: all vectors nearly identical (low semantic
+    separation), so top-1 vs top-K exact cosine gap is tiny."""
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n, d)).astype(np.float32)
+    X = 0.999 * X[0] + 0.001 * rng.standard_normal((n, d)).astype(np.float32)
+    return X / np.linalg.norm(X, axis=1, keepdims=True)
+
+
+def test_query_resolution_exposed():
+    """Phase 2a: the per-query top-1 vs top-K resolution is exposed on the
+    report (the 'blurry photo' is now measurable per query)."""
+    X = _blurry_corpus()
+    rep = audit_corpus(X, dim=128, k=10)
+    assert len(rep.query_resolution) > 0
+    for rec in rep.query_resolution:
+        assert "seed_query" in rec and "gap" in rec
+    # blurry corpus -> low resolution (below the 0.10 WARN threshold)
+    assert rep.metrics["top1_topk_gap"] < 0.10
+
+
+def test_fail_on_resolution_default_off():
+    """Phase 2b: fail_on_resolution defaults to False — the current behavior
+    is preserved (WARN, not FAIL) on a blurry corpus."""
+    X = _blurry_corpus()
+    rep = audit_corpus(X, dim=128, k=10)
+    res = [f for f in rep.flags if f.code == "embedding.resolution"]
+    assert res and res[0].severity == WARN
+    assert not rep.has_fail
+    # build_quality_engine does NOT raise by default
+    eng = build_quality_engine(X, dim=128, k=10)
+    assert eng is not None
+
+
+def test_fail_on_resolution_enabled_blocks():
+    """Phase 2b: with fail_on_resolution=True the same corpus escalates to
+    FAIL and build_quality_engine raises QualityGateError."""
+    X = _blurry_corpus()
+    cfg = QualityConfig(fail_on_resolution=True)
+    rep = audit_corpus(X, dim=128, k=10, cfg=cfg)
+    res = [f for f in rep.flags if f.code == "embedding.resolution"]
+    assert res and res[0].severity == FAIL
+    assert rep.has_fail
+    with pytest.raises(QualityGateError):
+        build_quality_engine(X, dim=128, k=10, cfg=cfg)
+
+
+def test_golden_model_card_synthetic():
+    """Phase 2c: the golden-set evaluator produces a RetrievalModelCard and
+    the contract check distinguishes a weak embedder from a strong one."""
+    from winnex_ai_normalize.core.golden import eval_provider, check_contract
+
+    class WeakEmbedder:
+        name = "test-weak"
+        def embed(self, texts):
+            v = np.zeros((len(texts), 64), dtype=np.float32)
+            for i, t in enumerate(texts):
+                for ch in t:
+                    v[i, ord(ch) % 64] += 1.0
+            return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+    class StrongEmbedder:
+        name = "test-strong"
+        def embed(self, texts):
+            import collections
+            v = np.zeros((len(texts), 256), dtype=np.float32)
+            for i, t in enumerate(texts):
+                toks = collections.Counter(t[j:j+3] for j in range(max(1, len(t)-2)))
+                for tok, cnt in toks.items():
+                    v[i, abs(hash(tok)) % 256] = cnt
+            return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+    weak = eval_provider(WeakEmbedder(), "test-weak", domain="legal", k=3)
+    strong = eval_provider(StrongEmbedder(), "test-strong", domain="legal", k=3)
+    assert weak.bound_violations == 0      # the proof still holds on both
+    assert strong.bound_violations == 0
+    assert strong.semantic_recall >= weak.semantic_recall
+    # the weak embedder fails the default contract floor, the strong passes
+    assert not check_contract(weak)
+    assert check_contract(strong)

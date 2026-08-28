@@ -77,6 +77,12 @@ class QualityConfig:
     fold_bound_frac: float = _FOLD_BOUND_FRAC
     fold_bound_frac_low: float = _FOLD_BOUND_FRAC_LOW
     resolution_gap_warn: float = _RESOLUTION_GAP_WARN
+    # Phase 2 (GAIA): when True, a low embedding resolution (top-1 vs top-K
+    # cosine gap below resolution_gap_warn) is escalated from WARN to FAIL,
+    # blocking the build via QualityGateError. Default False — the current
+    # behavior is unchanged (WARN only). Enable per-contract when the operator
+    # wants a hard floor on embedding semantic quality ("blurry photo" guard).
+    fail_on_resolution: bool = False
     drift_cos_warn: float = 0.90
     drift_cos_fail: float = 0.80
 
@@ -138,6 +144,13 @@ class QualityReport:
     # Optional engine already built with the suggested config (probe reuse)
     engine: object = None
 
+    # Per-query semantic resolution (Phase 2 / GAIA): the top-1 vs top-K exact
+    # cosine gap for EACH seed query, captured by the motor's own search. A low
+    # gap means the provider's embeddings barely discriminate top-K from top-1
+    # ("blurry photo"): recall is bounded by the embedding quality, not the
+    # engine. Exposed so operators can route per-query or enforce a floor.
+    query_resolution: list = field(default_factory=list)  # list[dict] per seed
+
     @property
     def fail_flags(self) -> List[Flag]:
         return [f for f in self.flags if f.severity == FAIL]
@@ -171,6 +184,7 @@ class QualityReport:
                 "metric": self.metric,
             },
             "excluded_seed_set": self.excluded_seed_set[:50],
+            "query_resolution": [dict(g) for g in self.query_resolution],
             "verdict": "fail" if self.has_fail else "warn" if self.warn_flags else "pass",
         }
 
@@ -297,12 +311,16 @@ class QualityValidator:
     """
 
     def __init__(self, k: int = 10, n_seed_queries: int = 8, seed: int = 42,
-                 probe_pca: bool = True, engine_kwargs: Optional[dict] = None):
+                 probe_pca: bool = True, engine_kwargs: Optional[dict] = None,
+                 fail_on_resolution: bool = False):
         self.k = k
         self.n_seed_queries = n_seed_queries
         self.seed = seed
         self.probe_pca = probe_pca
         self.engine_kwargs = engine_kwargs or {}
+        # Phase 2 (GAIA): escalate low embedding resolution from WARN to FAIL,
+        # blocking the build via QualityGateError. Off by default.
+        self.fail_on_resolution = fail_on_resolution
 
     def _build_engine(self, corpus, dim, metric, quant, basis, stage1_dim):
         import winnex_madhava as wm
@@ -323,6 +341,8 @@ class QualityValidator:
         """Run the seed queries against the engine; capture the excluded set.
 
         Returns (bound_count, prefilter_count, thresholds, gaps, captured).
+        `gaps` is a list of dicts {seed_query, gap} — the per-query top-1 vs
+        top-K exact cosine gap (Phase 2: exposed on QualityReport).
         """
         import winnex_madhava as wm
         n = len(corpus)
@@ -330,7 +350,7 @@ class QualityValidator:
         total_bound = 0
         total_pre = 0
         thresholds: List[float] = []
-        gaps: List[float] = []
+        gaps: List[dict] = []
         captured: List[dict] = []
         for qi in seed_idx:
             q = np.ascontiguousarray(corpus[qi], dtype=np.float32)
@@ -346,13 +366,14 @@ class QualityValidator:
                     "threshold": float(r.audit_threshold),
                     "seed_query": int(qi),
                 })
-            # embedding resolution: top-1 vs top-K exact cosine
+            # embedding resolution: top-1 vs top-K exact cosine. Exposed per
+            # query so a "blurry" query is distinguishable from a good one.
             if is_float and len(r.indices) >= 2 and norms is not None:
                 qn = float(np.linalg.norm(q))
                 if qn > 0:
                     c1 = float(corpus[r.indices[0]] @ q) / (norms[r.indices[0]] * qn)
                     ck = float(corpus[r.indices[-1]] @ q) / (norms[r.indices[-1]] * qn)
-                    gaps.append(c1 - ck)
+                    gaps.append({"seed_query": int(qi), "gap": c1 - ck})
         return total_bound, total_pre, thresholds, gaps, captured
 
     def validate(self, corpus, dim: Optional[int] = None, *,
@@ -485,7 +506,7 @@ class QualityValidator:
         pre_frac = tp / n_tot if n_tot else 0.0
         proof_ratio = tb / max(tb + tp, 1)
         mean_thr = float(np.mean(thr)) if thr else 0.0
-        mean_gap = float(np.mean(gaps)) if gaps else 0.0
+        mean_gap = float(np.mean([g["gap"] for g in gaps])) if gaps else 0.0
         report.metrics.update({
             "proof_ratio": proof_ratio,
             "bound_fraction": bound_frac,
@@ -495,6 +516,9 @@ class QualityValidator:
             "seed_queries": int(n_seed),
             "basis_probed": "random",
         })
+        # Phase 2: expose the per-query resolution (top-1 vs top-K gap) so the
+        # operator can route a "blurry" query to a stronger provider or block.
+        report.query_resolution = [dict(g) for g in gaps]
 
         # 2) routing decision
         if bound_frac >= 0.50:
@@ -563,10 +587,13 @@ class QualityValidator:
 
         # 3) embedding resolution (the third-party quality): if even the top-K
         #    are barely more similar than the top-1, the provider's embeddings
-        #    have poor semantic discrimination.
+        #    have poor semantic discrimination. WARN by default; escalated to
+        #    FAIL when fail_on_resolution is set (Phase 2 / GAIA: a hard floor
+        #    on embedding semantic quality, blocking via QualityGateError).
         if mean_gap >= 0 and mean_gap < 0.10:
+            sev = FAIL if self.fail_on_resolution else WARN
             report.add(Flag(
-                F_RESOLUTION, WARN,
+                F_RESOLUTION, sev,
                 f"top-1 vs top-{self.k} exact-cosine gap {mean_gap:.3f} (< 0.10) "
                 "— the embedding set has low semantic resolution; recall is "
                 "bounded by the provider's quality, not the engine.",
@@ -618,13 +645,15 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
         k=k or qc.k,
         n_seed_queries=n_seed_queries or qc.n_seed_queries,
         probe_pca=qc.probe_pca if probe_pca is None else probe_pca,
+        fail_on_resolution=qc.fail_on_resolution,
     )
     return validator.validate(corpus, dim=dim, reference=reference, provider=provider)
 
 
 def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
                          provider=None, allow_unsafe=False, return_report=False,
-                         engine_kwargs: Optional[dict] = None):
+                         engine_kwargs: Optional[dict] = None,
+                         cfg: Optional[QualityConfig] = None):
     """Run the quality gate (the engine's own validation), adapt the engine
     config, and build the engine.
 
@@ -632,7 +661,7 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
     Returns (engine, QualityReport) when return_report=True, else the engine.
     """
     report = audit_corpus(corpus, dim=dim, reference=reference, provider=provider,
-                          k=k)
+                          k=k, cfg=cfg)
     if report.has_fail and not allow_unsafe:
         raise QualityGateError(report)
 
