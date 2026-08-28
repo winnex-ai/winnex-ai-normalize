@@ -82,11 +82,34 @@ must never fabricate embeddings.
 
 ## Quality Flags — validating the input, not the search
 
-End-to-end recall is decided **before** the engine, in the quality of the data
-that enters it: third-party embedding quality, dataset integrity, and the
-prefilter heuristic. A corrupted dataset (e.g. the BIGANN base whose vector
-order differs from the ground truth) silently distorts recall while the engine
-keeps reporting `bound_violations == 0`.
+### The bottleneck they fix
+
+The recall bottleneck is **not** the search — it is decided **before** the
+engine, in the quality of the data that enters it:
+
+```
+R_end2end ≈ R_embedding_semantic × R_prefilter(heuristic) × R_bound(tightness) × R_postfilter(exact)
+                  ▲                     ▲                        ▲                      ▲
+             provider quality      k1_fraction             basis (random vs PCA)   exact on survivors
+```
+
+A bad corpus silently distorts recall **while the engine keeps reporting
+`bound_violations == 0`** — the proof stays sound on garbage. Real examples:
+
+- **BIGANN corrupted base** (vector order differs from the ground truth):
+  the engine returns "correct" top-K for data that means the wrong thing.
+  Recall vs the official GT dropped to 0.006; the engine was never at fault.
+- **Third-party embedding drift / provider failover** that switches vector
+  space mid-corpus: similarities become incomparable, 0 violations still.
+- **NaN / zero-variance / dim-shift**: the engine silently produces garbage
+  scores with a clean certificate.
+
+The Quality Flags exist to catch these failure classes **at ingest** — to
+identify the critic and resolve it **before** the data reaches the Madhava
+motor. That is the correction for the bottleneck: the validation moves to the
+point where the recall is actually decided.
+
+### How the flags validate (the engine's own proof)
 
 The quality gate validates the input using **the engine's own Cauchy-Schwarz
 proof** — no reimplemented math:
@@ -100,6 +123,26 @@ The validator launches that proof on seed queries and CAPTURES the excluded
 set (audit_ids / audit_threshold / pruned_by_bound / pruned_by_prefilter).
 The captured set IS the flag response.
 ```
+
+### How to use it — the guard at ingest
+
+The flags sit **in front of** `build_engine` and decide whether the data may
+reach the motor at all — and if it may, with what configuration:
+
+```python
+from winnex_ai_normalize.core.quality import build_quality_engine
+
+# GATE: raises QualityGateError if a FAIL flag fires (bad data never indexes).
+engine, report = build_quality_engine(embeddings, dim=384, return_report=True)
+# report.verdict == "fail"  → the corpus is blocked (see report.flags).
+# report.verdict == "pass"  → the engine is built with the ROUTED config
+#                            (basis/k1 chosen from the engine's own proof).
+```
+
+This is the correction for the bottleneck: instead of discovering that the
+data was bad **after** indexing (when recall already silently degraded), the
+quality gate makes the failure **loud and early** — at the point where the
+recall is decided, not where it is measured.
 
 ### Quick start
 
@@ -147,14 +190,45 @@ The validator **decides the engine config from the proof the engine produced**:
 | < 20% | probe with `pca_corpus`; if it proves ≥ 50% → pca, else `random`, `k1=0.20` |
 | any | `early_exit=False` always (the P0 fix: early-exit breaks recall at dim ≥ 384) |
 
-### Validated on real data
+### Validated — the benchmark
 
-| Dataset | Engine proof coverage | Routed config |
-|---|---|---|
-| BIGANN `base.u8bin` (60K×128, L2) | **99.3%** proven outside top-10 | `pca_corpus`, k1=0.05 |
-| arXiv OpenAI (d=1536, random) | **0.0%** (Fold Limit: loose bound) | `random`, k1=0.20 |
-| arXiv OpenAI (d=1536, PCA probe) | **80.2%** | `pca_corpus`, k1=0.05 |
-| Qwen2.5-0.5B quantized (d=896) | 0.0% (14 texts, neighbors in top-10) | `random`, k1=0.20 |
+`kaggle/bench_quality_flags/benchmark_normalize.py` (Kaggle kernel
+`winnex-quality-flags-normalize-1-1-0`) installs this package + winnex-madhava
+from PyPI **in isolation**, then asks the 6 binary questions the flags exist
+for. Result on Kaggle (v10, winnex-ai-normalize **1.1.0**, exit 0):
+
+| # | Test | Expected | Result |
+|---|---|---|---|
+| 1 | `valid_manifold` — healthy structured corpus | routes `pca_corpus`, k1=0.05, no FAIL | ✅ PASS |
+| 2 | `valid_isotropic` — healthy isotropic corpus | routes `random`, k1=0.20, no FAIL | ✅ PASS |
+| 3 | `nan` — NaN in the corpus | `dataset.nan` (FAIL) | ✅ PASS |
+| 4 | `degenerate` — zero variance | `dataset.degenerate` (FAIL) | ✅ PASS |
+| 5 | `dim_shift` — expected dim ≠ real (BIGANN/offset class) | `embedding.dim_shift` (FAIL) | ✅ PASS |
+| 6 | `drift` — batch in a divergent space (`reference=`) | `embedding.provider_drift` (FAIL) | ✅ PASS |
+
+Additional measured corpora (from the earlier full-data benchmark on the same
+kernel, real Kaggle datasets + real HuggingFace models): BIGANN proof 99.3%,
+arXiv d=1536 random 0% → PCA probe 80.2%, GloVe d=100 proof 94.5% with
+recall 1.0, Hacker News OpenAI d=1536 pca-bound 83.4% recall 0.994, MNIST
+d=784 proof 100% recall 0.862, and 6 news×model corpora routing `pca` with
+recall ≥ 0.99.
+
+### Validity conditions & scope
+
+- The Cauchy-Schwarz proof is **soundness of the pruning**: it guarantees that
+  nothing relevant was discarded by the bound. It is **not** a claim of
+  `recall = 1.0` end-to-end in the pipeline. Recall also depends on the
+  prefilter heuristic (`k1_fraction`) and on the embedding quality — factors
+  the proof does not control.
+- The bound is valid when the embedding space has an **inner product** and the
+  norms are computable (the Cauchy-Schwarz hypotheses). For uint8 raw-byte
+  corpora the engine uses L2 on raw bytes — the proof still runs, but the
+  [-1,1] embedding domain is lost unless you feed float32 (see
+  `quantize_corpus` caveat above).
+- The flags catch the **failure classes at ingest** (NaN, degenerate,
+  dim-shift, drift, cross-provider, alignment). They do not repair embeddings
+  or raise semantic recall — they make the problem **loud and early** so bad
+  data never silently distorts a benchmark or a production index.
 
 ### REST endpoint
 
