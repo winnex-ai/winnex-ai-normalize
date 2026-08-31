@@ -325,3 +325,82 @@ def test_golden_model_card_synthetic():
     # the weak embedder fails the default contract floor, the strong passes
     assert not check_contract(weak)
     assert check_contract(strong)
+
+
+# ---------------------------------------------------------------------------
+# Dataset presets (config externalizada por dataset — motor/normalize agnósticos)
+# ---------------------------------------------------------------------------
+
+def test_load_dataset_preset_default_agnostic():
+    """O preset default NÃO força basis/k1/stage — o roteador decide. Apenas
+    os fixes universais (pca_iterations=30, early_exit=False) são default."""
+    from winnex_ai_normalize.core.quality import load_dataset_preset
+    d = load_dataset_preset("default")
+    assert d["engine"].get("basis") is None          # agnóstico
+    assert d["engine"].get("k1_fraction") is None    # agnóstico
+    assert d["engine"].get("stage1_dim") is None     # agnóstico
+    assert d["engine"].get("pca_iterations") == 30   # fix universal
+    assert d["engine"].get("early_exit") is False    # fix universal
+
+
+def test_quality_config_from_dataset_arxiv():
+    """O preset 'arxiv' (manifold forte) roteia pca_corpus + pca_iterations=30."""
+    cfg = QualityConfig.from_dataset("arxiv")
+    assert cfg.engine_kwargs.get("basis") == "pca_corpus"
+    assert cfg.engine_kwargs.get("pca_iterations") == 30
+    assert cfg.engine_kwargs.get("stage1_dim") == 128
+
+
+def test_quality_config_from_dataset_isotropic_no_probe():
+    """O preset 'isotropic' (sem manifold) desliga o probe PCA — economiza o
+    build ~21-24s em d=1536 quando o PCA não ajuda."""
+    cfg = QualityConfig.from_dataset("isotropic")
+    assert cfg.probe_pca is False
+    assert cfg.engine_kwargs.get("basis") == "random"
+    assert cfg.engine_kwargs.get("k1_fraction") == 0.20
+
+
+def test_quality_config_from_dataset_unknown_falls_back_to_default():
+    """Dataset desconhecido → preset default agnóstico (sem crash)."""
+    cfg = QualityConfig.from_dataset("nao_existe")
+    assert cfg.probe_pca is True
+    # default é agnóstico: sem basis/k1 forçados
+    assert cfg.engine_kwargs.get("basis") is None
+
+
+def test_build_quality_engine_honors_forced_basis():
+    """BUG FIX (2026-08-31): o cfg_match antigo tinha erro de precedência
+    (o ternário `rdim == dim if dim is not None else True and ...` era
+    interpretado como `(rdim==dim) if (dim is not None) else ...`, ignorando
+    as verificações seguintes) — o basis forçado via engine_kwargs era
+    SILENCIOSAMENTE IGNORADO e o motor do probe (random) era reutilizado.
+
+    Com a correção, forçar basis='pca_corpus' deve aplicar a base PCA REAL
+    (verificável pelo pruned_by_bound alto, pois config().basis não reflete
+    set_basis no build_engine float32+pca)."""
+    X = _embeddings(n=3000, d=384, seed=0)
+    eng, rep = build_quality_engine(
+        X, dim=384, k=10, return_report=True,
+        engine_kwargs=dict(basis="pca_corpus", metric="cosine", normalize_input=True))
+    q = X[0].astype(np.float32)
+    r = eng.search(q)
+    # A base PCA REAL foi aplicada → pruned_by_bound alto (>50%)
+    pb_frac = r.pruned_by_bound / len(X)
+    assert pb_frac > 0.5, f"basis pca_corpus não aplicado (pb={pb_frac:.2f})"
+    # recall preservado e 0 violações
+    ex = set(eng.search_exact(q).indices)
+    rec = sum(1 for i in r.indices if i in ex) / 10
+    assert rec >= 0.9
+    assert r.bound_violations == 0
+
+
+def test_build_quality_engine_dataset_preset_applied():
+    """build_quality_engine(dataset='arxiv') aplica o preset (pca_corpus,
+    pca_iterations=30, stage1=128) sem o chamador precisar forçar kwargs."""
+    X = _embeddings(n=3000, d=384, seed=0)
+    eng, rep = build_quality_engine(X, dim=384, k=10, return_report=True, dataset="arxiv")
+    assert eng.config().pca_iterations == 30
+    assert eng.config().stage1_dim == 128
+    q = X[0].astype(np.float32)
+    r = eng.search(q)
+    assert r.bound_violations == 0

@@ -33,13 +33,78 @@ License: Business Source License 1.1 (BSL 1.1)
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 import numpy as np
 
 logger = logging.getLogger("winnex-ai-normalize.quality")
+
+# Presets JSON por dataset (motor e normalize AGNÓSTICOS — a config por dataset
+# vive no arquivo, não no código). Mesmo padrão do winnex_pipeline/configs/.
+# Os presets ficam em <pacote-raiz>/configs/ (winnex-ai-normalize/configs/),
+# ao lado do subpacote winnex_ai_normalize/ — subimos 2 níveis a partir de
+# winnex_ai_normalize/core/quality.py.
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))          # .../winnex_ai_normalize/core
+_PKG_DIR = os.path.dirname(_CORE_DIR)                            # .../winnex_ai_normalize
+_ROOT_DIR = os.path.dirname(_PKG_DIR)                            # .../winnex-ai-normalize
+_CONFIGS_DIR = os.path.join(_ROOT_DIR, "configs")
+# Overridável via env (permite apontar para um diretório de presets customizado).
+_ENV_CONFIGS_DIR = os.environ.get("WINNEX_AI_NORMALIZE_CONFIGS_DIR", _CONFIGS_DIR)
+
+
+def _deep_merge(base, override):
+    """Recursive dict merge. override values win (mesmo padrão do pipeline)."""
+    result = dict(base)
+    for k, v in (override or {}).items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def load_dataset_preset(dataset: Optional[str] = None) -> dict:
+    """Load a per-dataset preset JSON, deep-merged over the agnostic default.
+
+    - dataset=None or 'default' → the agnostic preset (router decides).
+    - dataset='arxiv' → configs/dataset_arxiv.json (manifold-strong: pca_corpus).
+    - dataset='isotropic' → configs/dataset_isotropic.json (no-manifold:
+      probe_pca=false, k1=0.20 — economiza o probe PCA de ~21-24s em d=1536).
+
+    O motor permanece agnóstico: os knobs (basis, pca_iterations, k1_fraction,
+    probe_pca, ...) vêm do preset; o motor apenas os aplica. A config por
+    dataset é externalizada no arquivo, não hardcoded.
+    """
+    default = load_dataset_preset_file("dataset_default")
+    if not dataset or dataset in ("default", "default.json", "dataset_default"):
+        return default
+    # Aceita 'arxiv' → dataset_arxiv.json; 'dataset_arxiv.json' → direto;
+    # 'dataset_arxiv' → dataset_arxiv.json.
+    name = dataset
+    if not name.endswith(".json"):
+        name = name if name.startswith("dataset_") else f"dataset_{name}"
+        name = f"{name}.json"
+    preset = load_dataset_preset_file(name)
+    return _deep_merge(default, preset)
+
+
+def load_dataset_preset_file(name: str) -> dict:
+    """Read one preset JSON from the configs dir (empty dict if missing)."""
+    fname = name if name.endswith(".json") else f"{name}.json"
+    path = os.path.join(_ENV_CONFIGS_DIR, fname)
+    if not os.path.exists(path):
+        logger.warning("dataset preset not found: %s — using agnostic default", path)
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("failed to load dataset preset %s: %s — using default", path, e)
+        return {}
 
 # Severity levels
 PASS = "pass"
@@ -67,7 +132,13 @@ _RESOLUTION_GAP_WARN = 0.10  # top1-topK cos gap below this → weak embedding
 
 @dataclass
 class QualityConfig:
-    """Thresholds for the quality checks (env: WINNEX_AI_NORMALIZE_QUALITY_*)."""
+    """Thresholds for the quality checks (env: WINNEX_AI_NORMALIZE_QUALITY_*).
+
+    Motor e normalize são AGNÓSTICOS: os knobs por dataset vêm do preset JSON
+    (configs/dataset_<name>.json), carregado por `QualityConfig.from_dataset()`.
+    Isto externaliza a config (basis, pca_iterations, k1_fraction, probe_pca,
+    ...) por dataset — o código não hardcodeia valores de dataset.
+    """
     enabled: bool = True
     k: int = 10                 # top-K used by the validation searches
     n_seed_queries: int = 8     # seed queries launched to trigger the proof
@@ -85,6 +156,36 @@ class QualityConfig:
     fail_on_resolution: bool = False
     drift_cos_warn: float = 0.90
     drift_cos_fail: float = 0.80
+
+    # Config do MOTOR sugerida pelo preset do dataset (engine_kwargs aplicados
+    # no build_engine). Vazia = agnóstica (o roteador decide pela prova).
+    # Ex.: {"basis": "pca_corpus", "pca_iterations": 30, "stage1_dim": 128}
+    engine_kwargs: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dataset(cls, dataset: Optional[str] = None) -> "QualityConfig":
+        """Load a QualityConfig from the per-dataset preset JSON (deep-merged
+        over the agnostic default). Os knobs (probe_pca, n_seed_queries, k,
+        thresholds e engine_kwargs) vêm do arquivo configs/dataset_<name>.json.
+
+        O motor e o normalize permanecem agnósticos: recebem os knobs do
+        config, não os hardcodeiam. `dataset=None` → preset default (roteador).
+        """
+        preset = load_dataset_preset(dataset)
+        q = preset.get("quality", {})
+        eng = preset.get("engine", {})
+        cfg = cls(
+            k=int(q.get("k", cls.k)),
+            n_seed_queries=int(q.get("n_seed_queries", cls.n_seed_queries)),
+            probe_pca=bool(q.get("probe_pca", cls.probe_pca)),
+            fold_bound_frac=float(q.get("fold_bound_frac", cls.fold_bound_frac)),
+            fold_bound_frac_low=float(q.get("fold_bound_frac_low", cls.fold_bound_frac_low)),
+            resolution_gap_warn=float(q.get("resolution_gap_warn", cls.resolution_gap_warn)),
+            fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
+        )
+        # engine_kwargs do preset: ignora valores null (o roteador decide).
+        cfg.engine_kwargs = {k: v for k, v in eng.items() if v is not None}
+        return cfg
 
 
 @dataclass
@@ -312,12 +413,19 @@ class QualityValidator:
 
     def __init__(self, k: int = 10, n_seed_queries: int = 8, seed: int = 42,
                  probe_pca: bool = True, engine_kwargs: Optional[dict] = None,
-                 fail_on_resolution: bool = False):
+                 fail_on_resolution: bool = False,
+                 pca_iterations: int = 30):
         self.k = k
         self.n_seed_queries = n_seed_queries
         self.seed = seed
         self.probe_pca = probe_pca
         self.engine_kwargs = engine_kwargs or {}
+        # G1 FIX (2026-08-31): pca_iterations=30 como default (o knob vem do
+        # preset dataset_default.json). O motor é agnóstico — o knob é do
+        # chamador. 30 converge o subespaço dominante (subspace sim=1.0 vs 200,
+        # medido) e corta ~3s do build PCA em d=1536 (que é O(D²·s·iters),
+        # ~21-24s). O chamador pode sobrescrever via engine_kwargs.
+        self.pca_iterations = int(pca_iterations)
         # Phase 2 (GAIA): escalate low embedding resolution from WARN to FAIL,
         # blocking the build via QualityGateError. Off by default.
         self.fail_on_resolution = fail_on_resolution
@@ -332,6 +440,7 @@ class QualityValidator:
             normalize_input=(metric == "cosine"),
             early_exit=False,       # the P0 fix: never degrade recall at dim ≥ 384
             postfilter=True,
+            pca_iterations=self.pca_iterations,
             seed=self.seed,
         )
         kw.update(self.engine_kwargs)
@@ -564,6 +673,11 @@ class QualityValidator:
                 report.basis = "pca_corpus"
                 report.k1_fraction = 0.05
                 report.engine = pca_engine
+                # FIX (2026-08-31): o stage1_dim do report deve refletir o probe
+                # pca (s1p), não o probe random (64). Sem isto, o build final
+                # usaria stage1=64 (do random) em vez de 192 (do pca), e o
+                # cfg_match do build_quality_engine não reutilizaria o probe.
+                report.stage1_dim = s1p
                 report.add(Flag(
                     F_FOLDABLE, PASS,
                     f"random basis proved only {bound_frac:.0%} (loose at "
@@ -641,11 +755,16 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
     engine configuration.
     """
     qc = cfg or QualityConfig()
+    # engine_kwargs do preset (config do motor por dataset, via JSON). O motor
+    # permanece agnóstico — recebe os knobs do config, não os hardcodeia.
+    preset_engine = dict(qc.engine_kwargs)
     validator = QualityValidator(
         k=k or qc.k,
         n_seed_queries=n_seed_queries or qc.n_seed_queries,
         probe_pca=qc.probe_pca if probe_pca is None else probe_pca,
         fail_on_resolution=qc.fail_on_resolution,
+        engine_kwargs=preset_engine,
+        pca_iterations=int(preset_engine.get("pca_iterations", 30)),
     )
     return validator.validate(corpus, dim=dim, reference=reference, provider=provider)
 
@@ -653,19 +772,37 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
 def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
                          provider=None, allow_unsafe=False, return_report=False,
                          engine_kwargs: Optional[dict] = None,
-                         cfg: Optional[QualityConfig] = None):
+                         cfg: Optional[QualityConfig] = None,
+                         dataset: Optional[str] = None):
     """Run the quality gate (the engine's own validation), adapt the engine
     config, and build the engine.
 
     Raises QualityGateError when FAIL flags are present and allow_unsafe=False.
     Returns (engine, QualityReport) when return_report=True, else the engine.
+
+    dataset : str, optional
+        Nome do preset por dataset (configs/dataset_<name>.json). O motor e o
+        normalize são AGNÓSTICOS — os knobs por dataset vêm do arquivo, não do
+        código. Ex.: 'arxiv' → pca_corpus/pca_iterations=30; 'word2vec' →
+        random/k1=0.20 (onde pca degrada recall); 'isotropic' → probe_pca=false
+        (economiza o probe de ~21-24s em d=1536). Se None, usa o roteador
+        agnóstico (dataset_default.json).
     """
+    if cfg is None and dataset is not None:
+        cfg = QualityConfig.from_dataset(dataset)
     report = audit_corpus(corpus, dim=dim, reference=reference, provider=provider,
                           k=k, cfg=cfg)
     if report.has_fail and not allow_unsafe:
         raise QualityGateError(report)
 
-    cfg = engine_kwargs or {}
+    # engine_kwargs: mescla o preset do dataset (cfg.engine_kwargs, do JSON) com
+    # os overrides explícitos do chamador (engine_kwargs param). O motor é
+    # agnóstico — recebe os knobs do config, não os hardcodeia.
+    preset_kwargs = dict(cfg.engine_kwargs) if cfg is not None else {}
+    explicit = {kk: vv for kk, vv in (engine_kwargs or {}).items() if vv is not None}
+    preset_kwargs.update(explicit)
+    caller_kwargs = preset_kwargs
+
     build_kwargs = {
         "metric": report.metric,
         "basis": report.basis,
@@ -676,19 +813,28 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
         "early_exit": report.early_exit,
         "k": k,
     }
-    build_kwargs.update({kk: vv for kk, vv in cfg.items() if vv is not None})
+    build_kwargs.update({kk: vv for kk, vv in caller_kwargs.items() if vv is not None})
 
     engine = None
     if report.engine is not None:
-        # Reuse the probe engine when the suggested config matches it.
+        # Reuse the probe engine ONLY when the suggested config matches the
+        # desired build — including basis and pca_iterations. BUG FIX
+        # (2026-08-31): o cfg_match antigo NÃO comparava basis, então forçar
+        # basis='pca_corpus' via engine_kwargs era silenciosamente ignorado e o
+        # motor do probe (random) era reutilizado — as colunas random/pca_corpus
+        # de benchmarks saíam idênticas. Agora a reutilização exige que o basis
+        # e o pca_iterations do motor do probe sejam os desejados.
         rcfg = report.engine.config()
         rdim = report.engine.dim()
-        cfg_match = (
-            rdim == dim if dim is not None else True
-            and int(rcfg.stage1_dim) == int(build_kwargs["stage1_dim"])
-            and int(rcfg.k1_fraction * 1000) == int(build_kwargs["k1_fraction"] * 1000)
-            and str(rcfg.metric).lower() in ("cosine", "cosine") or "cosine" in str(rcfg.metric)
-        )
+        # NOTA (2026-08-31): build_engine(float32, pca_corpus) constrói com
+        # cfg.basis=RANDOM e aplica a base PCA via set_basis() — config().basis
+        # NÃO reflete a base real. O discriminador confiável é stage1_dim
+        # (probe random=64, probe pca=192) + k1_fraction + metric.
+        dim_ok = (rdim == dim) if dim is not None else True
+        same_stage1 = int(rcfg.stage1_dim) == int(build_kwargs["stage1_dim"])
+        same_k1 = int(rcfg.k1_fraction * 1000) == int(build_kwargs["k1_fraction"] * 1000)
+        metric_ok = str(rcfg.metric).lower() in ("cosine", "cosine")
+        cfg_match = dim_ok and same_stage1 and same_k1 and metric_ok
         if cfg_match:
             engine = report.engine
 

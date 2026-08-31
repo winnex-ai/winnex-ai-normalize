@@ -1,0 +1,28 @@
+{
+  "__meta__": "Winnex AI Normalize — Google Word2Vec dataset preset",
+  "version": "1.1.1",
+  "dataset": "word2vec",
+  "description": "Google Word2Vec (d=300). Manifold FRACO para o bound: com basis random o recall@10 é 0.677 (pb=0%, pp=95% — o prefilter é o gate real); com pca_corpus o recall DEGRADA para 0.096 (medido, base colapsa). Portanto: basis=random, k1_fraction elevado (0.20) para proteger o recall. pca_iterations=30 não afeta (não usa pca).",
+
+  "engine": {
+    "basis": "random",
+    "metric": "cosine",
+    "quant": "none",
+    "stage1_dim": 64,
+    "stage2_dim": 0,
+    "k1_fraction": 0.20,
+    "k2_fraction": 0.20,
+    "k2_max": 2000,
+    "early_exit": false,
+    "postfilter": true,
+    "normalize_input": true,
+    "pca_iterations": 30,
+    "seed": 42
+  },
+
+  "quality": {
+    "probe_pca": false,
+    "n_seed_queries": 8,
+    "k": 10
+  }
+}

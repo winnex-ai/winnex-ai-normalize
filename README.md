@@ -190,6 +190,40 @@ The validator **decides the engine config from the proof the engine produced**:
 | < 20% | probe with `pca_corpus`; if it proves ≥ 50% → pca, else `random`, `k1=0.20` |
 | any | `early_exit=False` always (the P0 fix: early-exit breaks recall at dim ≥ 384) |
 
+### Per-dataset presets (config externalizada — motor/normalize agnósticos)
+
+O motor e o normalize são **agnósticos**: a config por dataset vive em presets
+JSON (`configs/dataset_<name>.json`), não no código. O operador escolhe o preset
+por dataset; o motor apenas aplica os knobs.
+
+```python
+from winnex_ai_normalize.core.quality import build_quality_engine, QualityConfig
+
+# 1. Via QualityConfig.from_dataset (carrega o preset JSON com deep-merge)
+cfg = QualityConfig.from_dataset("arxiv")        # → pca_corpus, pca_iterations=30
+eng, rep = build_quality_engine(X, dim=1536, return_report=True, cfg=cfg)
+
+# 2. Direto no build_quality_engine
+eng, rep = build_quality_engine(X, dim=300, return_report=True, dataset="word2vec")
+#   → random, k1=0.20 (onde pca_corpus degrada recall — medido 0.677→0.096)
+```
+
+Presets incluídos:
+
+| Preset | Quando usar | Config (engine) | Config (quality) |
+|---|---|---|---|
+| `default` | agnóstico — o roteador decide pela prova | vazio (router) | `probe_pca=true`, `pca_iterations=30` |
+| `arxiv` | manifold forte (d=1536, top-1 = 77% var) | `pca_corpus`, `stage1=128`, `pca_iterations=30` | `probe_pca=true` |
+| `sift` | manifold moderado (d=128) | `pca_corpus`, `stage1=64` | `probe_pca=true` |
+| `word2vec` | manifold fraco — pca DEGRADA recall | `random`, `k1=0.20` | `probe_pca=false` |
+| `isotropic` | sem manifold (ruído) — probe desperdiçado | `random`, `k1=0.20` | `probe_pca=false` |
+
+**Por que presets por dataset:** o `pca_corpus` (recomendado para manifold forte)
+pode DEGRADAR o recall em dados sem manifold (Word2Vec 0.677→0.096, ProtBERT
+1.0→0.134, medidos). E o probe PCA custa ~21-24s em d=1536 mesmo quando não
+ajuda — o preset `isotropic` desliga o probe (24.7s→0.06s medido). Externalizar
+a config por dataset deixa o operador decidir por dataset, sem tocar no código.
+
 ### Validated — the benchmark
 
 `kaggle/bench_quality_flags/benchmark_normalize.py` (Kaggle kernel

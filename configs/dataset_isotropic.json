@@ -1,0 +1,28 @@
+{
+  "__meta__": "Winnex AI Normalize — Isotropic / no-manifold dataset preset",
+  "version": "1.1.1",
+  "dataset": "isotropic",
+  "description": "Corpus isotrópico (sem manifold, ex.: ruído uniforme na esfera). O bound CS NÃO prova nada em nenhuma base (e(v)≈√(1-s/d), bound_frac=0.00 mesmo com pca_corpus). O probe PCA é DESPERDIÇADO — custa ~21-24s em d=1536 sem ganho. Este preset desliga o probe (probe_pca=false) e usa random com k1_fraction alto (0.20) — o prefilter é o gate de recall. Economiza até 25s no quality gate.",
+
+  "engine": {
+    "basis": "random",
+    "metric": "cosine",
+    "quant": "none",
+    "stage1_dim": 64,
+    "stage2_dim": 0,
+    "k1_fraction": 0.20,
+    "k2_fraction": 0.20,
+    "k2_max": 2000,
+    "early_exit": false,
+    "postfilter": true,
+    "normalize_input": true,
+    "pca_iterations": 30,
+    "seed": 42
+  },
+
+  "quality": {
+    "probe_pca": false,
+    "n_seed_queries": 6,
+    "k": 10
+  }
+}

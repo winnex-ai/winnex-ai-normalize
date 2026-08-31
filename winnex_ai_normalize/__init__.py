@@ -45,9 +45,10 @@ from .core.quality import (
     audit_corpus,
     build_quality_engine,
     check_embedding_drift,
+    load_dataset_preset,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 __all__ = [
     "NormalizeConfig",

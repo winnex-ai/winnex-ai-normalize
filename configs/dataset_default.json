@@ -1,0 +1,32 @@
+{
+  "__meta__": "Winnex AI Normalize — Default Dataset Preset (agnostic)",
+  "version": "1.1.1",
+  "dataset": "default",
+  "description": "Preset agnóstico: o QualityValidator decide a config pela prova do próprio motor (pruned_by_bound/N). Não força basis nem knobs de busca — o roteador é o gate. Apenas os fixes universais de segurança (pca_iterations=30 para acelerar o build PCA, early_exit=false para não degradar recall em dim ≥ 384) são default. Usado quando o operador não especifica um preset de dataset.",
+
+  "engine": {
+    "basis": null,
+    "metric": "cosine",
+    "quant": null,
+    "stage1_dim": null,
+    "stage2_dim": null,
+    "k1_fraction": null,
+    "k2_fraction": null,
+    "k2_max": 2000,
+    "early_exit": false,
+    "postfilter": true,
+    "normalize_input": true,
+    "pca_iterations": 30,
+    "seed": 42
+  },
+
+  "quality": {
+    "probe_pca": true,
+    "n_seed_queries": 8,
+    "k": 10,
+    "fold_bound_frac": 0.50,
+    "fold_bound_frac_low": 0.20,
+    "resolution_gap_warn": 0.10,
+    "fail_on_resolution": false
+  }
+}
