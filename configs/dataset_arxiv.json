@@ -1,9 +1,8 @@
 {
-  "__meta__": "Winnex AI Normalize — arXiv dataset preset",
+  "__meta__": "Winnex AI Normalize \u2014 arXiv dataset preset",
   "version": "1.1.1",
   "dataset": "arxiv",
-  "description": "arXiv OpenAI embeddings (d=1536). Manifold FORTE (top-1 autovetor explica ~77% da variância). O basis random deixa e(v)≈0.979 (bound inútil, recall 0.936); pca_corpus reduz e(v) para ~0.34 e restaura recall 1.0 com 63% de pruning por prova. pca_iterations=30 converge o subespaço dominante (subspace sim=1.0 vs 200) e corta ~3s do build PCA (que é O(D²·s·iters), ~21-24s em d=1536).",
-
+  "description": "arXiv OpenAI embeddings (d=1536). Manifold FORTE (top-1 autovetor explica ~77% da vari\u00e2ncia). O basis random deixa e(v)\u22480.979 (bound in\u00fatil, recall 0.936); pca_corpus reduz e(v) para ~0.34 e restaura recall 1.0 com 63% de pruning por prova. pca_iterations=30 converge o subespa\u00e7o dominante (subspace sim=1.0 vs 200) e corta ~3s do build PCA (que \u00e9 O(D\u00b2\u00b7s\u00b7iters), ~21-24s em d=1536).",
   "engine": {
     "basis": "pca_corpus",
     "metric": "cosine",
@@ -20,10 +19,10 @@
     "pca_sample": 10000,
     "seed": 42
   },
-
   "quality": {
     "probe_pca": true,
     "n_seed_queries": 8,
-    "k": 10
+    "k": 10,
+    "nan_policy": "block_pca"
   }
 }

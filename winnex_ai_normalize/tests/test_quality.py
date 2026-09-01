@@ -404,3 +404,78 @@ def test_build_quality_engine_dataset_preset_applied():
     q = X[0].astype(np.float32)
     r = eng.search(q)
     assert r.bound_violations == 0
+
+
+# ---------------------------------------------------------------------------
+# nan_policy (knob do config): NaN nunca roteia pca_corpus (causa raiz Word2Vec)
+# ---------------------------------------------------------------------------
+def _embeddings_with_nan(n=600, d=128, seed=0, n_nan=1):
+    X = _embeddings(n=n, d=d, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    idx = rng.choice(n, n_nan, replace=False)
+    X[idx, 0] = np.nan
+    return X
+
+
+def test_nan_policy_block_pca_routes_random():
+    """nan_policy='block_pca' (default): corpus com NaN → roteador NUNCA
+    escolhe pca_corpus; força random + k1 alto, e desliga o probe PCA."""
+    X = _embeddings_with_nan()
+    rep = audit_corpus(X, dim=128, n_seed_queries=4)
+    # dataset.nan é FAIL e o roteador não sugere pca
+    assert rep.has_fail
+    assert any(f.code == F_NAN for f in rep.flags)
+    assert rep.basis == "random"
+    assert rep.k1_fraction >= 0.15
+    # nan_fraction exposto na telemetria
+    assert rep.metrics.get("nan_fraction", 0) > 0
+
+
+def test_nan_policy_block_pca_overrides_forced_pca():
+    """Mesmo quando o chamador FORÇA basis='pca_corpus' com NaN presente,
+    a política 'block_pca' impede o contorno — o motor buildado é random."""
+    X = _embeddings_with_nan()
+    eng, rep = build_quality_engine(
+        X, dim=128, k=10, return_report=True, allow_unsafe=True,
+        engine_kwargs=dict(basis="pca_corpus", metric="cosine", normalize_input=True))
+    # config().basis é RANDOM (sem PCA aplicado via set_basis)
+    assert "RANDOM" in str(eng.config().basis)
+    # o report não sugere pca
+    assert rep.basis == "random"
+    assert rep.k1_fraction >= 0.15
+
+
+def test_nan_policy_block_build_blocks():
+    """nan_policy='block_build': NaN presente → QualityGateError (FAIL estrito),
+    mesmo com o preset forçando pca_corpus."""
+    X = _embeddings_with_nan()
+    cfg = QualityConfig(nan_policy="block_build")
+    with pytest.raises(QualityGateError):
+        build_quality_engine(X, dim=128, k=10, cfg=cfg)
+    # allow_unsafe=True prossegue
+    eng, rep = build_quality_engine(X, dim=128, k=10, cfg=cfg, allow_unsafe=True,
+                                    return_report=True)
+    assert eng is not None
+    assert rep.has_fail
+
+
+def test_nan_policy_ignore_does_not_route_random():
+    """nan_policy='ignore': a proteção é desligada — o roteador pode sugerir
+    pca_corpus mesmo com NaN (para medir a degradação / debug)."""
+    X = _embeddings_with_nan()
+    cfg = QualityConfig(nan_policy="ignore")
+    rep = audit_corpus(X, dim=128, n_seed_queries=4, cfg=cfg)
+    # continua FAIL por dataset.nan, mas o basis pode ser pca (sem override)
+    assert rep.has_fail
+    assert any(f.code == F_NAN for f in rep.flags)
+
+
+def test_nan_policy_from_dataset_preset():
+    """O knob nan_policy viaja no preset JSON (config agnóstica)."""
+    cfg = QualityConfig.from_dataset("default")
+    assert cfg.nan_policy == "block_pca"
+    cfg = QualityConfig.from_dataset("word2vec")
+    assert cfg.nan_policy == "block_pca"
+    # preset desconhecido → default (block_pca)
+    cfg = QualityConfig.from_dataset("nao_existe")
+    assert cfg.nan_policy == "block_pca"

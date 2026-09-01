@@ -2,7 +2,7 @@
   "__meta__": "Winnex AI Normalize — Google Word2Vec dataset preset",
   "version": "1.1.1",
   "dataset": "word2vec",
-  "description": "Google Word2Vec (d=300). Manifold FRACO para o bound: com basis random o recall@10 é 0.677 (pb=0%, pp=95% — o prefilter é o gate real); com pca_corpus o recall DEGRADA para 0.096 (medido, base colapsa). Portanto: basis=random, k1_fraction elevado (0.20) para proteger o recall. pca_iterations=30 não afeta (não usa pca).",
+  "description": "Google Word2Vec (d=300). Manifold FRACO para o bound: com basis random o recall@10 é 0.677 (pb=0%, pp=95% — o prefilter é o gate real); com pca_corpus o recall DEGRADA para 0.096 (medido, base colapsa). Causa raiz: NaN/inf no dataset corrompem a covariância do PCA (1 NaN → recall 0.042, reproduzido). Portanto: basis=random, k1_fraction elevado (0.20) para proteger o recall; nan_policy='block_pca' — se houver NaN, nunca usa pca_corpus. pca_iterations=30 não afeta (não usa pca).",
 
   "engine": {
     "basis": "random",
@@ -23,6 +23,7 @@
   "quality": {
     "probe_pca": false,
     "n_seed_queries": 8,
-    "k": 10
+    "k": 10,
+    "nan_policy": "block_pca"
   }
 }

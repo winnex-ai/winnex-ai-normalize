@@ -27,6 +27,7 @@
     "fold_bound_frac": 0.50,
     "fold_bound_frac_low": 0.20,
     "resolution_gap_warn": 0.10,
-    "fail_on_resolution": false
+    "fail_on_resolution": false,
+    "nan_policy": "block_pca"
   }
 }

@@ -156,6 +156,18 @@ class QualityConfig:
     fail_on_resolution: bool = False
     drift_cos_warn: float = 0.90
     drift_cos_fail: float = 0.80
+    # Política de NaN/inf (um knob do config, NÃO uma regra hardcoded — motor
+    # e normalize agnósticos). O `pca_corpus` AMPLIFICA corrupção de dados:
+    # um único NaN na matriz de covariância C=A.T@A vira autovetor NaN →
+    # set_basis(P1) com base NaN → bound "certeiro" mas recall despenca
+    # (medido: 1 linha NaN/300d → pca recall 0.042 vs random 1.0). O que o
+    # preset decide sobre isso é política, não engenharia do motor.
+    #   "block_pca"  → NaN presente ⇒ nunca pca_corpus; roteia random + k1 alto
+    #                  (protege recall; o corpus degradado vira não-foldable).
+    #   "block_build" → NaN presente ⇒ bloqueia o build inteiro (FAIL estrito;
+    #                  requer allow_unsafe para prosseguir).
+    #   "ignore"     → roda sem proteção (para medir a degradação / debug).
+    nan_policy: str = "block_pca"
 
     # Config do MOTOR sugerida pelo preset do dataset (engine_kwargs aplicados
     # no build_engine). Vazia = agnóstica (o roteador decide pela prova).
@@ -182,6 +194,7 @@ class QualityConfig:
             fold_bound_frac_low=float(q.get("fold_bound_frac_low", cls.fold_bound_frac_low)),
             resolution_gap_warn=float(q.get("resolution_gap_warn", cls.resolution_gap_warn)),
             fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
+            nan_policy=str(q.get("nan_policy", cls.nan_policy)),
         )
         # engine_kwargs do preset: ignora valores null (o roteador decide).
         cfg.engine_kwargs = {k: v for k, v in eng.items() if v is not None}
@@ -286,6 +299,7 @@ class QualityReport:
             },
             "excluded_seed_set": self.excluded_seed_set[:50],
             "query_resolution": [dict(g) for g in self.query_resolution],
+            "nan_fraction": round(float(self.metrics.get("nan_fraction", 0.0)), 8),
             "verdict": "fail" if self.has_fail else "warn" if self.warn_flags else "pass",
         }
 
@@ -414,12 +428,14 @@ class QualityValidator:
     def __init__(self, k: int = 10, n_seed_queries: int = 8, seed: int = 42,
                  probe_pca: bool = True, engine_kwargs: Optional[dict] = None,
                  fail_on_resolution: bool = False,
-                 pca_iterations: int = 30):
+                 pca_iterations: int = 30,
+                 nan_policy: str = "block_pca"):
         self.k = k
         self.n_seed_queries = n_seed_queries
         self.seed = seed
         self.probe_pca = probe_pca
         self.engine_kwargs = engine_kwargs or {}
+        self.nan_policy = nan_policy
         # G1 FIX (2026-08-31): pca_iterations=30 como default (o knob vem do
         # preset dataset_default.json). O motor é agnóstico — o knob é do
         # chamador. 30 converge o subespaço dominante (subspace sim=1.0 vs 200,
@@ -511,6 +527,7 @@ class QualityValidator:
             return report
 
         # --- NaN / inf (float only; uint8 cannot hold NaN) ---
+        nan_frac = 0.0
         if is_float:
             nan_frac = float(1.0 - np.isfinite(arr).mean())
             if nan_frac > 0.0:
@@ -521,6 +538,8 @@ class QualityValidator:
                     f"({nan_frac:.4%}) — the engine would silently produce "
                     "garbage scores with 0 bound violations.",
                     metric=nan_frac))
+        has_nan = nan_frac > 0.0
+        report.metrics["nan_fraction"] = nan_frac
 
         # --- degeneracy (RAW space, before normalization) ---
         if is_float:
@@ -630,6 +649,28 @@ class QualityValidator:
         report.query_resolution = [dict(g) for g in gaps]
 
         # 2) routing decision
+        # nan_policy (knob do config, agnóstico): quando o corpus tem NaN/inf e
+        # a política bloqueia pca, o roteador NUNCA escolhe pca_corpus — o PCA
+        # amplifica a corrupção (1 NaN na covariância → autovetor NaN → recall
+        # despenca, medido 0.042). "block_pca" força random + k1 alto; o FAIL
+        # de dataset.nan já está no report (bloqueado por build_quality_engine
+        # a menos que allow_unsafe). "ignore" desliga a proteção.
+        if has_nan and self.nan_policy == "block_pca":
+            report.basis = "random"
+            report.k1_fraction = 0.20
+            report.engine = eng_random
+            report.add(Flag(
+                F_FOLDABLE, WARN,
+                f"corpus has NaN/inf ({nan_frac:.4%}) and nan_policy="
+                f"'block_pca' — pca_corpus would amplify the corruption "
+                "(covariance → NaN eigenvectors → recall collapse, measured); "
+                "forcing basis=random, k1=0.20. Re-audit after cleaning.",
+                metric=nan_frac, threshold=0.0))
+            # (não muta self.probe_pca — este early-return já pula o probe e
+            #  não afeta chamadas subsequentes do validator)
+            report.excluded_seed_set = captured
+            report.stage1_dim = s1
+            return report
         if bound_frac >= 0.50:
             report.basis = "pca_corpus"
             report.k1_fraction = 0.05
@@ -765,6 +806,7 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
         fail_on_resolution=qc.fail_on_resolution,
         engine_kwargs=preset_engine,
         pca_iterations=int(preset_engine.get("pca_iterations", 30)),
+        nan_policy=qc.nan_policy,
     )
     return validator.validate(corpus, dim=dim, reference=reference, provider=provider)
 
@@ -813,6 +855,17 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
         "early_exit": report.early_exit,
         "k": k,
     }
+    # nan_policy='block_pca': o basis FORÇADO (do preset ou do chamador) não
+    # pode contornar a proteção — pca_corpus sobre corpus NaN amplifica a
+    # corrupção (medido: recall 0.042 vs random 1.0). O roteador já forçou
+    # random; aqui garantimos que um basis vindo de engine_kwargs não reforce
+    # pca_corpus por cima da decisão da política.
+    nan_frac = float(report.metrics.get("nan_fraction", 0.0))
+    nan_blocked = nan_frac > 0.0 and (cfg.nan_policy if cfg is not None else "block_pca") == "block_pca"
+    if nan_blocked:
+        for kw in ("basis",):
+            caller_kwargs = dict(caller_kwargs)
+            caller_kwargs[kw] = "random"
     build_kwargs.update({kk: vv for kk, vv in caller_kwargs.items() if vv is not None})
 
     engine = None

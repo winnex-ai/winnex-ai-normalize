@@ -1,9 +1,8 @@
 {
-  "__meta__": "Winnex AI Normalize — SIFT-1M dataset preset",
+  "__meta__": "Winnex AI Normalize \u2014 SIFT-1M dataset preset",
   "version": "1.1.1",
   "dataset": "sift",
-  "description": "SIFT-1M (d=128, features de imagem reais). Manifold moderado (50% da variância em 2-4 dims). random e pca_corpus ambos atingem recall 1.0; pca_corpus prova mais (pb≈99.9% vs 96%). Build PCA barato em d=128 (~0.7s), então pca_corpus é seguro. pca_iterations=30 basta (subspace sim=1.0).",
-
+  "description": "SIFT-1M (d=128, features de imagem reais). Manifold moderado (50% da vari\u00e2ncia em 2-4 dims). random e pca_corpus ambos atingem recall 1.0; pca_corpus prova mais (pb\u224899.9% vs 96%). Build PCA barato em d=128 (~0.7s), ent\u00e3o pca_corpus \u00e9 seguro. pca_iterations=30 basta (subspace sim=1.0).",
   "engine": {
     "basis": "pca_corpus",
     "metric": "cosine",
@@ -19,10 +18,10 @@
     "pca_iterations": 30,
     "seed": 42
   },
-
   "quality": {
     "probe_pca": true,
     "n_seed_queries": 8,
-    "k": 10
+    "k": 10,
+    "nan_policy": "block_pca"
   }
 }
