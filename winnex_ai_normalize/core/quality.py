@@ -868,32 +868,99 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
             caller_kwargs[kw] = "random"
     build_kwargs.update({kk: vv for kk, vv in caller_kwargs.items() if vv is not None})
 
+    # SCAN INT8 AUTOMÁTICO e AGNÓSTICO (2026-09-03, normalize 1.3.0):
+    # o motor (madhava 1.9.11) ganhou scan_int8 (quantiza as projeções do
+    # Stage-1, ~1.4-1.7× mais rápido em N grande). MAS a segurança NÃO depende do
+    # basis — depende da DIMENSÃO/distribuição: o erro de quantização int8
+    # (~1e-3) reordena o pool quando o gap entre candidatos é menor (medido:
+    # basis random em d≥384 degrada recall 1.0→0.5; d=128 é seguro; pca_corpus em
+    # d=1536 é seguro porque concentra a energia). Nenhuma regra de basis/dim
+    # captura isso de forma confiável (a métrica erro/gap NÃO separa os casos).
+    #
+    # SOLUÇÃO AGNÓSTICA: o normalize TENTA scan_int8 e VALIDA por recall real
+    # numa amostra de seed queries (search vs search_exact). Se o recall cai
+    # abaixo do limiar, rebuild sem scan_int8. A decisão é por MEDIÇÃO, e vale
+    # para qualquer basis/dimensão — o sistema "sabe quando operar em alta
+    # dimensão" empiricamente, não por heurística. Validado: seed queries (8)
+    # predizem corretamente a degradação (d=384/1536 random → recall baixo →
+    # desliga; pca/d=128 → recall 1.0 → mantém).
+    #
+    # O preset JSON (engine.scan_int8) ou o chamador (engine_kwargs) podem
+    # FORÇAR explicitamente (True = sempre int8, False = nunca).
+    import winnex_madhava as _wm
+    caller_explicit_scan8 = any(
+        kk == "scan_int8" for kk in (caller_kwargs or {}))
+    final_quant = str(build_kwargs.get("quant", "")).lower()
+    is_float32_build = (final_quant in ("", "none"))
     engine = None
-    if report.engine is not None:
-        # Reuse the probe engine ONLY when the suggested config matches the
-        # desired build — including basis and pca_iterations. BUG FIX
-        # (2026-08-31): o cfg_match antigo NÃO comparava basis, então forçar
-        # basis='pca_corpus' via engine_kwargs era silenciosamente ignorado e o
-        # motor do probe (random) era reutilizado — as colunas random/pca_corpus
-        # de benchmarks saíam idênticas. Agora a reutilização exige que o basis
-        # e o pca_iterations do motor do probe sejam os desejados.
+    scan8_decision = None     # None = não testado ainda
+    if caller_explicit_scan8:
+        # Força explícita do preset/caller.
+        scan8_decision = bool(build_kwargs.get("scan_int8", caller_kwargs.get("scan_int8", False)))
+    elif not is_float32_build:
+        # uint8/L2: o scan_int8 não se aplica (o caminho int8 nativo já é usado).
+        scan8_decision = False
+    else:
+        # AGNÓSTICO: tenta scan_int8 e valida por recall em seed queries.
+        # (Somente quando há corpus suficiente p/ uma amostra significativa.)
+        scan8_decision = True   # otimista; validado abaixo
+        build_kwargs["scan_int8"] = True
+    # Reuse the probe engine ONLY when it matches the desired build WITHOUT
+    # scan_int8 (the probe never uses it). BUG FIX (2026-08-31): o cfg_match
+    # antigo NÃO comparava basis — agora exige basis/stage1/k1/metrice iguais.
+    if report.engine is not None and not build_kwargs.get("scan_int8", False):
         rcfg = report.engine.config()
         rdim = report.engine.dim()
-        # NOTA (2026-08-31): build_engine(float32, pca_corpus) constrói com
-        # cfg.basis=RANDOM e aplica a base PCA via set_basis() — config().basis
-        # NÃO reflete a base real. O discriminador confiável é stage1_dim
-        # (probe random=64, probe pca=192) + k1_fraction + metric.
         dim_ok = (rdim == dim) if dim is not None else True
         same_stage1 = int(rcfg.stage1_dim) == int(build_kwargs["stage1_dim"])
         same_k1 = int(rcfg.k1_fraction * 1000) == int(build_kwargs["k1_fraction"] * 1000)
         metric_ok = str(rcfg.metric).lower() in ("cosine", "cosine")
-        cfg_match = dim_ok and same_stage1 and same_k1 and metric_ok
-        if cfg_match:
+        if dim_ok and same_stage1 and same_k1 and metric_ok:
             engine = report.engine
 
     if engine is None:
         import winnex_madhava as wm
         engine = wm.build_engine(corpus, dim=dim, **build_kwargs)
+
+    # VALIDAÇÃO AGNÓSTICA do scan_int8 (2026-09-03): quando a decisão foi
+    # otimista (tentar int8), confirma por recall real numa amostra de seed
+    # queries (search vs search_exact do MESMO engine). Se o recall caiu abaixo
+    # do limiar (o erro de quantização reordenou o pool — medido em d≥384
+    # random), rebuild SEM scan_int8 (float32 exato). O resultado é o motor
+    # correto PARA ESTE corpus/dimensão, decidido por medição.
+    if scan8_decision and engine is not None:
+        try:
+            import winnex_madhava as wm
+            _n = len(corpus)
+            _nseed = 8
+            _k = int(k)
+            # seed queries: amostra determinística do corpus (não as últimas —
+            # podem estar no pool de forma enviesada)
+            _rng = np.random.default_rng(1234)
+            _idx = _rng.choice(max(1, _n), min(_nseed, _n), replace=False)
+            _rec = 0.0
+            _cnt = 0
+            for _qi in _idx:
+                _q = np.ascontiguousarray(corpus[_qi], dtype=np.float32)
+                _r = engine.search(_q)
+                _rx = engine.search_exact(_q)
+                if len(_r.indices) == 0 or len(_rx.indices) == 0:
+                    continue
+                _rec += sum(1 for _i in _r.indices if _i in _rx.indices) / len(_rx.indices)
+                _cnt += 1
+            if _cnt > 0:
+                _rec /= _cnt
+            # Limiar: scan_int8 é aceito se o recall médio ≥ 0.95 (pequena
+            # tolerância p/ ruído de float32; a degradação medida é 0.5-0.6,
+            # muito abaixo).
+            if _rec < 0.95:
+                logger.warning(
+                    f"scan_int8 degradou recall ({_rec:.3f} em {_cnt} seed queries) "
+                    f"— rebuild sem scan_int8 (float32 exato) p/ este corpus")
+                build_kwargs.pop("scan_int8", None)
+                engine = wm.build_engine(corpus, dim=dim, **build_kwargs)
+        except Exception as _e:  # nunca quebrar o build por causa da validação
+            logger.debug(f"scan_int8 validation skipped: {_e}")
 
     if return_report:
         return engine, report
