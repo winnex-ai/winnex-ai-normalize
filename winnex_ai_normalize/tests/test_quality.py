@@ -659,3 +659,25 @@ def test_match_route_conditions():
                         rules, 0.95)["basis"] == "random"
     # missing metric → fallback
     assert _match_route({"bound_fraction": 0.6}, rules, 0.95)["basis"] == "random"
+
+
+def test_foldable_flag_pca_without_probe_no_crash():
+    """REGRESSION (2026-09-04, 1.4.1): when the route table picks pca_corpus
+    via the FIRST rule (random bound_fraction >= 0.50), the PCA probe never
+    runs and `pca_proved` is None. The F_FOLDABLE flag message formatted
+    `{pca_proved:.0%}` → `TypeError: unsupported format string passed to
+    NoneType.__format__`, crashing build_quality_engine on ANY strong manifold
+    (measured: d=64/100/128). The fix treats pca_proved None as nan in the
+    message. This test builds a strong low-dim manifold (the trigger) and
+    asserts no crash + the pca route is applied."""
+    rng = np.random.RandomState(0)
+    N, d, ncomp = 20000, 64, 8
+    comp = rng.randn(ncomp, d).astype(np.float32)
+    X = (rng.randn(N, ncomp).astype(np.float32) @ comp).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    # strong manifold at d=64: random basis proves >= 50% → pca route via rule 1,
+    # the PCA probe is skipped (d <= probe_pca_dim_gate) → pca_proved is None.
+    eng, rep = build_quality_engine(X, dim=d, k=10, return_report=True)
+    assert rep.basis == "pca_corpus"
+    # the F_FOLDABLE flag must be present and well-formed (no crash)
+    assert any(f.code == F_FOLDABLE for f in rep.flags)

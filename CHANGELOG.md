@@ -5,6 +5,23 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-09-04
+
+### Fixed: `build_quality_engine` crash when the route picks `pca_corpus` without a PCA probe
+
+The `F_FOLDABLE` flag message formatted `{pca_proved:.0%}`. When the route
+table picks `pca_corpus` via its FIRST rule (`random bound_fraction >= 0.50`),
+the PCA probe never runs and `pca_proved` is `None` — so the format raised
+`TypeError: unsupported format string passed to NoneType.__format__`. This
+crashed `build_quality_engine` on ANY strong manifold (measured: d=64/100/128)
+with or without `return_report=True`, blocking the production normalize→madhava
+flow. The message now treats a missing probe as `nan`, matching the existing
+`pca_recall` guard.
+
+Regression test: `test_foldable_flag_pca_without_probe_no_crash` (strong
+low-dim manifold → pca route without probe → no crash, flag well-formed).
+49/49 tests pass.
+
 ## [1.4.0] — 2026-09-04
 
 ### Changed: routing policy moved from CODE to CONFIG (`route_rules`) — the router is now agnostic

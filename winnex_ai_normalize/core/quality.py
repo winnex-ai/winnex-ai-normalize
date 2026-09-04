@@ -1034,7 +1034,8 @@ class QualityValidator:
                 F_FOLDABLE, PASS,
                 f"route table chose basis=pca_corpus, k1={report.k1_fraction} "
                 f"(random bound_frac={bound_frac:.0%}, pca bound_frac="
-                f"{pca_proved:.0%}, pca seed recall "
+                f"{pca_proved if pca_proved is not None else float('nan'):.0%}, "
+                f"pca seed recall "
                 f"{pca_recall if pca_recall is not None else float('nan'):.3f}).",
                 metric=bound_frac,
                 threshold=_FOLD_BOUND_FRAC if bound_frac >= _FOLD_BOUND_FRAC
