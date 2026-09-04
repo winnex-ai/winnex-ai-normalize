@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winnex-ai-normalize"
-version = "1.3.0"
+version = "1.4.0"
 description = "Input normalization plug for the Madhava engine — embed text via any provider (OpenAI, Qwen3, nano, xfactor), validate/normalize to float32/uint8, with provider failover and NO fake-vector fallback. Consumed by winnex-madhava, winnex-tracer, Liferay and the Maestro."
 readme = "README.md"
 requires-python = ">=3.10"

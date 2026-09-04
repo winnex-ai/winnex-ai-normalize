@@ -29,6 +29,29 @@
     "resolution_gap_warn": 0.10,
     "fail_on_resolution": false,
     "nan_policy": "block_pca",
-    "recall_floor": 0.95
+    "nan_blocked_route": { "basis": "random", "k1_fraction": 0.20 },
+    "recall_floor": 0.95,
+    "stage1_probe_random": 64,
+    "stage1_probe_pca": 192,
+    "probe_pca_dim_gate": 64,
+    "route_rules": [
+      {
+        "when": { "bound_fraction": ">= 0.50" },
+        "route": { "basis": "pca_corpus", "k1_fraction": 0.05 }
+      },
+      {
+        "when": { "bound_fraction": ">= 0.20" },
+        "route": { "basis": "random", "k1_fraction": 0.10 }
+      },
+      {
+        "when": {
+          "bound_fraction": "< 0.20",
+          "bound_fraction_pca": ">= 0.50",
+          "seed_recall_vs_exact_pca": ">= _recall_floor_"
+        },
+        "route": { "basis": "pca_corpus", "k1_fraction": 0.05 }
+      },
+      { "fallback": { "basis": "random", "k1_fraction": 0.20 } }
+    ]
   }
 }

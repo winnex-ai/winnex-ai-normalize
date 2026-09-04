@@ -576,23 +576,22 @@ def test_recall_floor_configurable_from_preset():
     assert QualityConfig(recall_floor=0.9).recall_floor == 0.9
 
 
-def test_pca_route_with_low_recall_emits_fail():
-    """The reversal guard: when the PCA probe PROVES the corpus (high bound) but
-    its REAL seed recall drops below the floor, the route must NOT be pca_corpus
-    — the PCA is capturing corruption/noise (false manifold). The flag is FAIL
-    (the router must not suggest a base that loses recall). We unit-test the
-    guard directly because on CLEAN synthetic corpora PCA never degrades recall
-    (verified empirically: it either proves little or proves a lot with recall
-    1.0); the failure only fires on corrupted/noisy data, which we simulate by
-    driving the flag helper with a measured low pca recall."""
+def test_recall_shortfall_is_a_signal_not_a_decision():
+    """(2026-09-04, agnostic redesign) `dataset.recall_not_guaranteed` is a
+    SIGNAL: when the applied route is pool_only with recall below the floor, the
+    code emits a WARN and does NOT reverse/block. Reversing ("never pca when
+    recall < floor") is a route_rules policy of the CONFIG, not code. We
+    unit-test the flag helper: any route with low recall → WARN (never FAIL from
+    the code alone)."""
     from winnex_ai_normalize.core.quality import QualityValidator, QualityReport
+    # low recall on a pca route → WARN (the code does not decide to fail/reverse)
     v = QualityValidator()
     rep = QualityReport(n=100, dim=128)
     v._flag_recall_shortfall(rep, 0.40, 1.0, ["pool_only"] * 8, 0.95,
                              route="pca_corpus")
-    fails = [f for f in rep.flags if f.code == F_RECALL]
-    assert fails and fails[0].severity == FAIL
-    assert "DEGRADED" in fails[0].message or "below" in fails[0].message
+    flags = [f for f in rep.flags if f.code == F_RECALL]
+    assert flags and flags[0].severity == WARN
+    assert not rep.has_fail  # signal only — no block from the code
 
 
 def test_random_route_with_low_recall_emits_warn_not_fail():
@@ -607,3 +606,56 @@ def test_random_route_with_low_recall_emits_warn_not_fail():
     warns = [f for f in rep.flags if f.code == F_RECALL]
     assert warns and warns[0].severity == WARN
     assert not rep.has_fail
+
+
+def test_route_rules_are_config_not_code():
+    """(2026-09-04) The routing decision is the CONFIG's: changing route_rules
+    changes the route. Prove it by forcing a corpus that would naturally route
+    pca_corpus to instead route random via a custom route table."""
+    from winnex_ai_normalize.core.quality import QualityConfig, audit_corpus
+    X = _embeddings(n=1500, d=128, seed=0)  # strong manifold → pca by default
+    # default table → pca_corpus (bound_frac high)
+    rep_default = audit_corpus(X, dim=128, n_seed_queries=6)
+    assert rep_default.basis == "pca_corpus"
+    # custom table: force random with a low k1 (a policy the operator chose)
+    cfg = QualityConfig(route_rules=[
+        {"when": {"bound_fraction": ">= 0.0"},
+         "route": {"basis": "random", "k1_fraction": 0.05}},
+        {"fallback": {"basis": "random", "k1_fraction": 0.20}},
+    ])
+    rep_custom = audit_corpus(X, dim=128, n_seed_queries=6, cfg=cfg)
+    assert rep_custom.basis == "random"
+    assert rep_custom.k1_fraction == 0.05
+
+
+def test_route_rules_default_reproduces_historical_behavior():
+    """(2026-09-04) The DEFAULT route table reproduces the historical router
+    behavior exactly, so existing callers see no change: strong manifold → pca,
+    isotropic high-dim → random/k1 high."""
+    X = _embeddings(n=1500, d=128, seed=0)   # strong → pca
+    rep = audit_corpus(X, dim=128, n_seed_queries=6)
+    assert rep.basis == "pca_corpus"
+    assert rep.k1_fraction <= 0.10
+
+    X2 = _isotropic(n=300, d=512, seed=4)     # no manifold → random/k1 high
+    rep2 = audit_corpus(X2, dim=512, n_seed_queries=6, probe_pca=False)
+    assert rep2.basis == "random"
+    assert rep2.k1_fraction >= 0.15
+
+
+def test_match_route_conditions():
+    """(2026-09-04) The route-table interpreter evaluates conditions correctly."""
+    from winnex_ai_normalize.core.quality import _match_route
+    rules = [
+        {"when": {"bound_fraction": ">= 0.50", "seed_recall_vs_exact": ">= 0.95"},
+         "route": {"basis": "pca_corpus", "k1_fraction": 0.05}},
+        {"fallback": {"basis": "random", "k1_fraction": 0.20}},
+    ]
+    # both conditions match → pca
+    assert _match_route({"bound_fraction": 0.6, "seed_recall_vs_exact": 1.0},
+                        rules, 0.95)["basis"] == "pca_corpus"
+    # recall below floor → falls to fallback (random)
+    assert _match_route({"bound_fraction": 0.6, "seed_recall_vs_exact": 0.80},
+                        rules, 0.95)["basis"] == "random"
+    # missing metric → fallback
+    assert _match_route({"bound_fraction": 0.6}, rules, 0.95)["basis"] == "random"

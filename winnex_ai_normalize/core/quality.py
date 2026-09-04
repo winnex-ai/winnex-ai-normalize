@@ -67,6 +67,66 @@ def _deep_merge(base, override):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Route-table interpreter (2026-09-04): applies the ROUTING POLICY that lives
+# in the config (route_rules), NOT in code. The validator measures corpus
+# signals (bound_fraction, pca_bound_fraction, seed_recall_vs_exact, ...) and
+# this function picks the first rule whose `when` matches. The code is a
+# generic interpreter — it knows nothing about specific datasets.
+# ---------------------------------------------------------------------------
+_OPS = {
+    ">=": lambda a, b: a >= b,
+    ">": lambda a, b: a > b,
+    "<=": lambda a, b: a <= b,
+    "<": lambda a, b: a < b,
+    "==": lambda a, b: a == b,
+}
+
+
+def _match_route(metrics: dict, route_rules: list, recall_floor: float) -> dict:
+    """Return the FIRST route whose `when` conditions ALL match the measured
+    metrics, or the `fallback` if no rule matches (or no route_rules given).
+    `metrics` is the report.metrics dict (signal space). Returns a dict of
+    engine-knob overrides, e.g. {"basis": "pca_corpus", "k1_fraction": 0.05}.
+    """
+    for rule in route_rules or []:
+        if "fallback" in rule:
+            continue  # evaluated only if no when-rule matches
+        when = rule.get("when", {})
+        route = rule.get("route", {})
+        if not when or not route:
+            continue
+        ok = True
+        for key, cond in when.items():
+            val = metrics.get(key)
+            if val is None or val != val:  # missing metric or NaN → no match
+                ok = False
+                break
+            cond_s = str(cond).strip()
+            matched = False
+            # inject recall_floor into the condition if referenced
+            c = cond_s.replace("_recall_floor_", repr(float(recall_floor)))
+            for op, fn in _OPS.items():
+                if c.startswith(op):
+                    rhs = c[len(op):].strip()
+                    try:
+                        threshold = float(rhs)
+                    except ValueError:
+                        continue
+                    matched = fn(float(val), threshold)
+                    break
+            if not matched:
+                ok = False
+                break
+        if ok:
+            return dict(route)
+    # fallback
+    for rule in route_rules or []:
+        if "fallback" in rule:
+            return dict(rule["fallback"])
+    return {}
+
+
 def load_dataset_preset(dataset: Optional[str] = None) -> dict:
     """Load a per-dataset preset JSON, deep-merged over the agnostic default.
 
@@ -137,8 +197,37 @@ _RESOLUTION_GAP_WARN = 0.10  # top1-topK cos gap below this → weak embedding
 # manifold, random k1=0.05 → recall 0.75 with viol=0, pool_only 20/20). We now
 # validate the REAL recall (search vs the motor's own search_exact) on the seed
 # queries and expose recall_guarantee. recall_floor is the minimum mean recall
-# a suggested config must meet; below it the config is flagged / reversed.
+# a suggested config must meet; below it the config is flagged.
 _RECALL_FLOOR = 0.95
+
+# Default route table (2026-09-04): reproduces the historical router behavior
+# so that a bare `QualityConfig()` (no preset loaded) behaves as before. The
+# routing POLICY lives here / in the preset JSON — NOT in code branches. See
+# the `route_rules` field docstring for the format. The special token
+# "_recall_floor_" is replaced by the configured recall_floor at match time.
+_DEFAULT_ROUTE_RULES = [
+    {"when": {"bound_fraction": ">= 0.50"},
+     "route": {"basis": "pca_corpus", "k1_fraction": 0.05}},
+    {"when": {"bound_fraction": ">= 0.20"},
+     "route": {"basis": "random", "k1_fraction": 0.10}},
+    # loose random bound → probe PCA: foldable under a tight basis AND the
+    # measured pca seed recall holds (>= recall_floor) → route pca. The recall
+    # gate is a POLICY (recall_floor), applied to the measured signal. The
+    # metric keys are the ACTUAL report.metrics keys the validator exposes:
+    #   bound_fraction (random), bound_fraction_pca, seed_recall_vs_exact_pca.
+    {"when": {"bound_fraction": "< 0.20",
+              "bound_fraction_pca": ">= 0.50",
+              "seed_recall_vs_exact_pca": ">= _recall_floor_"},
+     "route": {"basis": "pca_corpus", "k1_fraction": 0.05}},
+    {"fallback": {"basis": "random", "k1_fraction": 0.20}},
+]
+
+# NaN-blocked route (2026-09-04): when nan_policy='block_pca' forces the route
+# away from pca_corpus (pca amplifies NaN corruption), the SAFE route the code
+# applies. This is a config policy — the code does not invent it. A random
+# route needs a higher k1 (the prefilter is the recall gate when the bound is
+# loose on a degraded corpus).
+_NAN_BLOCKED_ROUTE = {"basis": "random", "k1_fraction": 0.20}
 
 
 @dataclass
@@ -180,14 +269,51 @@ class QualityConfig:
     #   "ignore"     → roda sem proteção (para medir a degradação / debug).
     nan_policy: str = "block_pca"
 
+    # NAN-BLOCKED ROUTE (2026-09-04): when nan_policy='block_pca' forces the
+    # route away from pca_corpus (pca amplifies NaN corruption), the SAFE route
+    # the code applies. This is a config POLICY — a random route needs a higher
+    # k1 (the prefilter is the recall gate when the bound is loose on a
+    # degraded corpus). Lives in the preset JSON (quality.nan_blocked_route).
+    nan_blocked_route: dict = field(default_factory=lambda: dict(_NAN_BLOCKED_ROUTE))
+
     # RECALL FLOOR (2026-09-04): minimum mean seed recall@K (search vs the
-    # motor's own search_exact) a SUGGESTED config must meet. The router used
-    # to decide by bound coverage alone; a loose-bound config can be pool_only
-    # with recall < 1.0 and viol=0 (silent collapse). Below this floor the
-    # config is flagged `dataset.recall_not_guaranteed` and, for a PCA-suggested
-    # route, reversed to random/k1-high (the prefilter becomes the recall gate).
-    # Agnostic knob: lives in the preset JSON (quality.recall_floor), not code.
+    # motor's own search_exact) a SUGGESTED config must meet. Below the floor
+    # the config is flagged `dataset.recall_not_guaranteed`. The floor is a
+    # POLICY of the config (the operator decides what recall is acceptable);
+    # the code only measures and flags — it does NOT reverse the route. If the
+    # operator wants "never pca when recall < floor", that is a route_rules
+    # entry in the preset JSON, not code. Agnostic knob.
     recall_floor: float = _RECALL_FLOOR
+
+    # Stage-1 probe dimensions (2026-09-04): the dimensions the QUALITY
+    # VALIDATOR uses to MEASURE the corpus signals (bound coverage under a
+    # random basis and, optionally, a PCA basis). These are MEASUREMENT knobs,
+    # not the final route — the final engine config comes from route_rules.
+    # They replace the hardcoded min(64, d) / min(192, d) / d > 64 in the code.
+    stage1_probe_random: int = 64    # s1 of the random probe
+    stage1_probe_pca: int = 192      # s1p of the PCA probe (if enabled)
+    probe_pca_dim_gate: int = 64     # probe PCA only when dim > this
+
+    # ROUTE RULES (2026-09-04): the DECISION TABLE that maps measured corpus
+    # signals to an engine route (basis / k1_fraction / stage1_dim). This is
+    # where the ROUTING POLICY lives — in the config, not in code. The code
+    # only MEASURES the signals (bound_fraction, pca_bound_fraction,
+    # seed_recall_vs_exact, ...) and applies the first rule whose `when`
+    # matches. Format (see configs/dataset_default.json):
+    #   [
+    #     {"when": {"bound_fraction": ">= 0.50"},
+    #      "route": {"basis": "pca_corpus", "k1_fraction": 0.05}},
+    #     {"when": {"bound_fraction": "< 0.20", "pca_bound_fraction": ">= 0.50",
+    #               "pca_seed_recall": ">= 0.95"},
+    #      "route": {"basis": "pca_corpus", "k1_fraction": 0.05}},
+    #     {"fallback": {"basis": "random", "k1_fraction": 0.20}}
+    #   ]
+    # Supported operators: ">=", ">", "<=", "<", "==". A `when` with multiple
+    # conditions requires ALL to match (AND). Missing metric keys → condition
+    # does not match. The last entry may be {"fallback": {...}} (always used if
+    # no `when` rule matches). The default table (below) reproduces the
+    # historical router behavior EXACTLY, so existing callers see no change.
+    route_rules: list = field(default_factory=lambda: list(_DEFAULT_ROUTE_RULES))
 
     # Config do MOTOR sugerida pelo preset do dataset (engine_kwargs aplicados
     # no build_engine). Vazia = agnóstica (o roteador decide pela prova).
@@ -216,9 +342,20 @@ class QualityConfig:
             fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
             nan_policy=str(q.get("nan_policy", cls.nan_policy)),
             recall_floor=float(q.get("recall_floor", cls.recall_floor)),
+            # route_rules + probe knobs (2026-09-04): a política de roteamento e
+            # as dimensões de PROBE vêm do preset JSON — o código não decide.
+            route_rules=list(q.get("route_rules") or _DEFAULT_ROUTE_RULES),
+            stage1_probe_random=int(q.get("stage1_probe_random", 64)),
+            stage1_probe_pca=int(q.get("stage1_probe_pca", 192)),
+            probe_pca_dim_gate=int(q.get("probe_pca_dim_gate", 64)),
+            nan_blocked_route=dict(q.get("nan_blocked_route") or _NAN_BLOCKED_ROUTE),
         )
         # engine_kwargs do preset: ignora valores null (o roteador decide).
         cfg.engine_kwargs = {k: v for k, v in eng.items() if v is not None}
+        # Se o preset não define route_rules, usa a tabela default (que
+        # reproduz o comportamento histórico).
+        if not cfg.route_rules:
+            cfg.route_rules = list(_DEFAULT_ROUTE_RULES)
         return cfg
 
 
@@ -432,14 +569,17 @@ class QualityValidator:
       - prefilter share = pruned_by_prefilter / N  (the heuristic cut, no
         proof)
 
-    Routing decision:
-      - proof coverage ≥ 0.50        → foldable, strong: basis=pca_corpus, k1=0.05
-      - 0.20 ≤ coverage < 0.50       → foldable, moderate: basis=random, k1=0.10
-      - coverage < 0.20              → loose bound: PROBE with pca_corpus (the
-        engine's own tight basis). If the PCA basis proves ≥0.50 → the corpus
-        is foldable under a tight basis → basis=pca_corpus. Else → genuinely
-        non-foldable (isotropic / noise): basis=random, k1=0.20 (the prefilter
-        is the real recall gate).
+    Routing POLICY (2026-09-04): the mapping from measured signals to an
+    engine route (basis / k1_fraction / stage1_dim) lives in the CONFIG
+    (`route_rules` in the preset JSON), NOT in code branches. This validator
+    MEASURES the signals (proof coverage, pca coverage, seed recall) and then
+    APPLIES the first route_rules entry whose `when` matches. The default table
+    (in dataset_default.json / _DEFAULT_ROUTE_RULES) reproduces the historical
+    behavior:
+      - proof coverage ≥ 0.50        → basis=pca_corpus, k1=0.05
+      - 0.20 ≤ coverage < 0.50       → basis=random, k1=0.10
+      - coverage < 0.20 → PCA probe: if pca proves ≥0.50 AND its seed recall
+        ≥ recall_floor → basis=pca_corpus; else fallback → random/k1=0.20.
 
     The optional PCA probe uses the ENGINE's pca_corpus build — the engine's
     own validation, not a reimplementation. probe_pca=False skips it (avoids
@@ -451,16 +591,30 @@ class QualityValidator:
                  fail_on_resolution: bool = False,
                  pca_iterations: int = 30,
                  nan_policy: str = "block_pca",
-                 recall_floor: float = _RECALL_FLOOR):
+                 nan_blocked_route: Optional[dict] = None,
+                 recall_floor: float = _RECALL_FLOOR,
+                 route_rules: Optional[list] = None,
+                 stage1_probe_random: int = 64,
+                 stage1_probe_pca: int = 192,
+                 probe_pca_dim_gate: int = 64):
         self.k = k
         self.n_seed_queries = n_seed_queries
         self.seed = seed
         self.probe_pca = probe_pca
         self.engine_kwargs = engine_kwargs or {}
         self.nan_policy = nan_policy
+        self.nan_blocked_route = dict(nan_blocked_route or _NAN_BLOCKED_ROUTE)
+        # ROUTE RULES + PROBE KNOBS (2026-09-04): the routing POLICY and the
+        # probe measurement dimensions come from the config. The code applies
+        # the table; it does not invent policy.
+        self.route_rules = list(route_rules) if route_rules else list(_DEFAULT_ROUTE_RULES)
+        self.stage1_probe_random = int(stage1_probe_random)
+        self.stage1_probe_pca = int(stage1_probe_pca)
+        self.probe_pca_dim_gate = int(probe_pca_dim_gate)
         # RECALL FLOOR (2026-09-04): minimum mean seed recall@K (search vs the
-        # motor's own search_exact) a SUGGESTED config must meet; below it the
-        # config is flagged and (for a PCA route) reversed to random/k1-high.
+        # motor's own search_exact) a SUGGESTED config must meet. Below the
+        # floor the config is flagged (WARN) — the code does NOT reverse the
+        # route; the policy for "never pca when recall < floor" is the config's.
         self.recall_floor = float(recall_floor)
         # G1 FIX (2026-08-31): pca_iterations=30 como default (o knob vem do
         # preset dataset_default.json). O motor é agnóstico — o knob é do
@@ -567,12 +721,13 @@ class QualityValidator:
 
     def _flag_recall_shortfall(self, report, mean_recall, pool_only_frac,
                                guarantees, recall_floor, *, route=None):
-        """Emit `dataset.recall_not_guaranteed` when the suggested config is
-        pool_only or its measured seed recall is below the floor — the honest
-        exposure of the silent collapse (recall < 1.0 with viol=0). Severity:
-        WARN by default (weak manifold is a physical limit, not corruption);
-        FAIL when a PCA route was chosen yet recall dropped below the floor
-        (the router must NOT suggest pca_corpus that degrades recall).
+        """Emit `dataset.recall_not_guaranteed` as a SIGNAL (2026-09-04): when
+        the applied route is pool_only with measured seed recall below the
+        floor, or pool_only with material recall loss, flag it so the operator
+        SEES that the returned top-K is not the global top-K (the silent
+        collapse). Severity is always WARN — the code does NOT decide to block
+        or reverse; that policy belongs to the config (route_rules /
+        recall_floor / fail thresholds).
         """
         if mean_recall != mean_recall:      # nan → search_exact unavailable
             return
@@ -580,22 +735,18 @@ class QualityValidator:
         n_pool = sum(1 for g in guarantees if g == "pool_only")
         below = mean_recall < recall_floor
         # pool_only alone is not a defect (the default IS pool_only when the
-        # bound is loose); what matters is whether the recall is < 1.0 in a way
-        # the router should flag. We flag when recall is measurably below floor
-        # OR when the operator would read "pass" while the top-K is pool_only
-        # with material recall loss.
-        if not below and not (pool_only_frac > 0.5 and mean_recall < 0.999):
+        # bound is loose); flag when recall is measurably below the floor OR
+        # when the top-K is pool_only with material recall loss (< 1.0 in a way
+        # the operator should not read as "perfect").
+        if not below and not (pool_only_frac > 0.5 and mean_recall < 1.0):
             return
-        sev = FAIL if (route == "pca_corpus" and below) else WARN
         msg = (f"seed recall@K = {mean_recall:.3f} vs the motor's own "
                f"search_exact (< floor {recall_floor:.2f}); "
                f"{n_pool}/{nq} seed queries are recall_guarantee=pool_only — "
                "the returned top-K is the best WITHIN the pool, NOT proven the "
                "global top-K. viol=0 does not cover this (silent collapse). "
                "For a global guarantee use audit_exhaustive=True or k1=N.")
-        if route == "pca_corpus" and below:
-            msg += " pca_corpus DEGRADED recall despite high bound coverage — reversing route."
-        report.add(Flag(F_RECALL, sev, msg, metric=mean_recall,
+        report.add(Flag(F_RECALL, WARN, msg, metric=mean_recall,
                         threshold=recall_floor))
 
     def validate(self, corpus, dim: Optional[int] = None, *,
@@ -714,15 +865,21 @@ class QualityValidator:
         n_seed = min(self.n_seed_queries, n)
         seed_idx = rng.choice(n, n_seed, replace=False)
 
-        # 1) measure with the RANDOM basis (fast, honest worst case)
-        s1 = min(64, d)
+        # 1) measure with the RANDOM basis (fast, honest worst case). The probe
+        #    dimension is a MEASUREMENT knob from the config (agnostic), not a
+        #    hardcoded min(64, d).
+        s1 = min(int(self.stage1_probe_random), d)
         try:
             eng_random = self._build_engine(arr, d, metric, quant, "random", s1)
         except Exception as e:  # engine unavailable (not installed) → no flag
             logger.warning(f"quality validator: engine build failed ({e}) — "
                            "skipping the Cauchy-Schwarz proof coverage flag")
-            report.basis = "random"
-            report.k1_fraction = 0.20
+            # Cannot measure → apply the config's FALLBACK route (a conservative
+            # random/k1). This is the config's policy, not a code decision.
+            fb = _match_route({}, self.route_rules, self.recall_floor)
+            report.basis = fb.get("basis", "random")
+            report.k1_fraction = float(fb.get("k1_fraction", 0.20))
+            report.stage1_dim = s1
             return report
         res = self._run(eng_random, arr, norms, d, is_float, seed_idx)
         tb = res["bound_count"]
@@ -774,107 +931,80 @@ class QualityValidator:
         route_guarantees = list(guarantees)
         route_pool_frac = pool_only_frac
 
-        # 2) routing decision
-        # nan_policy (knob do config, agnóstico): quando o corpus tem NaN/inf e
-        # a política bloqueia pca, o roteador NUNCA escolhe pca_corpus — o PCA
-        # amplifica a corrupção (1 NaN na covariância → autovetor NaN → recall
-        # despenca, medido 0.042). "block_pca" força random + k1 alto; o FAIL
-        # de dataset.nan já está no report (bloqueado por build_quality_engine
-        # a menos que allow_unsafe). "ignore" desliga a proteção.
+        # 2) MEASURE the PCA probe (if the config enables it): an optional
+        #    tight-basis signal used by the route table below. This is
+        #    MEASUREMENT (agnostic), not a decision.
+        pca_proved = None
+        pca_engine = None
+        pca_recall = None
+        pca_res = None
+        if self.probe_pca and d > int(self.probe_pca_dim_gate):
+            try:
+                s1p = min(int(self.stage1_probe_pca), d)
+                eng_pca = self._build_engine(arr, d, metric, quant,
+                                             "pca_corpus", s1p)
+                pca_res = self._run(eng_pca, arr, norms, d,
+                                    is_float, seed_idx)
+                pca_proved = pca_res["bound_count"] / n_tot if n_tot else 0.0
+                pca_engine = eng_pca
+                pca_recall = self._mean(pca_res["recalls"])
+                report.metrics["bound_fraction_pca"] = pca_proved
+                if pca_recall == pca_recall:
+                    report.metrics["seed_recall_vs_exact_pca"] = pca_recall
+                report.metrics["basis_probed"] = "random+pca_corpus"
+            except Exception as e:  # pragma: no cover
+                logger.warning(f"PCA probe failed ({e}) — keeping random")
+
+        # 3) APPLY the route table (the config's POLICY). The code does NOT
+        #    decide basis/k1 — it applies the first route_rules entry whose
+        #    `when` matches the measured signals. The default table (in the
+        #    preset JSON) reproduces the historical behavior, so existing
+        #    callers see no change; operators change policy by editing the
+        #    JSON, not the code.
+        route_knobs = _match_route(report.metrics, self.route_rules,
+                                   self.recall_floor)
+
+        # nan_policy (a SAFETY policy declared in the config, not a dataset
+        # decision): when the corpus has NaN/inf and the policy blocks pca, the
+        # applied route is never pca_corpus — pca amplifies corruption (1 NaN
+        # in the covariance → NaN eigenvectors → recall collapse, measured
+        # 0.042). This overrides the route table's choice, applying the config's
+        # nan_blocked_route (a random route with a safe k1).
         if has_nan and self.nan_policy == "block_pca":
-            report.basis = "random"
-            report.k1_fraction = 0.20
-            report.engine = eng_random
+            nb = self.nan_blocked_route
+            route_knobs = dict(nb)
             report.add(Flag(
                 F_FOLDABLE, WARN,
                 f"corpus has NaN/inf ({nan_frac:.4%}) and nan_policy="
                 f"'block_pca' — pca_corpus would amplify the corruption "
                 "(covariance → NaN eigenvectors → recall collapse, measured); "
-                "forcing basis=random, k1=0.20. Re-audit after cleaning.",
+                f"forcing {nb.get('basis')} (k1={nb.get('k1_fraction')}). "
+                "Re-audit after cleaning.",
                 metric=nan_frac, threshold=0.0))
-            # (não muta self.probe_pca — este early-return já pula o probe e
-            #  não afeta chamadas subsequentes do validator)
-            report.excluded_seed_set = captured
-            report.stage1_dim = s1
-            # RECALL VALIDATION: even the NaN-blocked random/k1=0.20 route can be
-            # pool_only with recall < 1.0 (silent collapse on a degraded corpus).
-            self._flag_recall_shortfall(report, mean_recall, pool_only_frac,
-                                        guarantees, recall_floor=self.recall_floor)
-            return report
-        if bound_frac >= 0.50:
-            report.basis = "pca_corpus"
-            report.k1_fraction = 0.05
-            report.engine = eng_random
-            # random already proves ≥50% with recall ~1.0 (measured below); the
-            # suggested pca_corpus build tightens further — recall of this route
-            # is validated at the end against the FINAL engine.
-            route_recall = mean_recall
-            route_guarantees = list(guarantees)
-            route_pool_frac = pool_only_frac
-            report.add(Flag(
-                F_FOLDABLE, PASS,
-                f"Cauchy-Schwarz PROVED {bound_frac:.0%} of the corpus is "
-                f"outside top-{self.k} (random basis, seed recall "
-                f"{mean_recall:.3f}) — the corpus is foldable; basis=pca_corpus "
-                "tightens the bound further.",
-                metric=bound_frac, threshold=0.50))
-        elif bound_frac >= 0.20:
-            report.basis = "random"
-            report.k1_fraction = 0.10
-            report.engine = eng_random
-            route_recall = mean_recall
-            route_guarantees = list(guarantees)
-            route_pool_frac = pool_only_frac
-            report.add(Flag(
-                F_FOLDABLE, PASS,
-                f"Cauchy-Schwarz proved {bound_frac:.0%} of the corpus "
-                f"(prefilter {pre_frac:.0%}, seed recall {mean_recall:.3f}) — "
-                "moderately foldable; k1=0.10 keeps recall safe.",
-                metric=bound_frac, threshold=0.20))
+
+        # Apply the config's route to the report.
+        report.basis = route_knobs.get("basis", "random")
+        report.k1_fraction = float(route_knobs.get("k1_fraction", 0.20))
+        # stage1_dim: if the config's route pins a stage1, use it; else the
+        # random-probe dim (s1) or the pca-probe dim when pca was chosen.
+        route_stage1 = route_knobs.get("stage1_dim")
+        if route_stage1 is not None:
+            report.stage1_dim = int(route_stage1)
+        elif report.basis == "pca_corpus" and pca_engine is not None:
+            report.stage1_dim = s1p
         else:
-            # Loose bound on the random basis. Probe with the engine's OWN
-            # pca_corpus basis to decide foldable-under-tight-basis vs
-            # genuinely isotropic.
-            pca_proved = None
-            pca_engine = None
-            pca_recall = None
-            pca_res = None
-            if self.probe_pca and d > 64:
-                try:
-                    s1p = min(192, d)
-                    eng_pca = self._build_engine(arr, d, metric, quant,
-                                                 "pca_corpus", s1p)
-                    pca_res = self._run(eng_pca, arr, norms, d,
-                                        is_float, seed_idx)
-                    pca_proved = pca_res["bound_count"] / n_tot if n_tot else 0.0
-                    pca_engine = eng_pca
-                    pca_recall = self._mean(pca_res["recalls"])
-                    report.metrics["bound_fraction_pca"] = pca_proved
-                    if pca_recall == pca_recall:
-                        report.metrics["seed_recall_vs_exact_pca"] = pca_recall
-                    report.metrics["basis_probed"] = "random+pca_corpus"
-                except Exception as e:  # pragma: no cover
-                    logger.warning(f"PCA probe failed ({e}) — keeping random")
-            # RECALL-VALIDATED PCA ROUTE (2026-09-04): the probe must NOT be
-            # chosen by bound coverage alone. If the PCA basis PROVES a lot but
-            # its real recall (search vs search_exact) is below the floor, the
-            # PCA is capturing corruption/noise (e(v)≈0 is a false manifold) →
-            # do NOT route pca_corpus; fall back to random/k1-high (the
-            # prefilter becomes the recall gate). This is "validate the PCA
-            # probe by recall, not by bound".
-            pca_ok = (pca_proved is not None and pca_proved >= 0.50
-                      and pca_recall == pca_recall and pca_recall >= self.recall_floor)
-            if pca_ok:
-                report.basis = "pca_corpus"
-                report.k1_fraction = 0.05
-                report.engine = pca_engine
-                # FIX (2026-08-31): o stage1_dim do report deve refletir o probe
-                # pca (s1p), não o probe random (64). Sem isto, o build final
-                # usaria stage1=64 (do random) em vez de 192 (do pca), e o
-                # cfg_match do build_quality_engine não reutilizaria o probe.
-                report.stage1_dim = s1p
-                # the FINAL route is the validated PCA build → recall/guarantee
-                # of the report reflect the PCA engine, not the discarded random.
+            report.stage1_dim = s1
+        # Which probe engine to attach for reuse by build_quality_engine: the
+        # one matching the chosen basis. When the route is pca but the PCA
+        # probe did not run (e.g. the random basis already proved >=50%, so the
+        # route table's first rule fired), there is NO pca probe engine to
+        # reuse — report.engine stays None and build_quality_engine constructs a
+        # real pca_corpus engine. This keeps report ↔ engine consistent (no more
+        # "report says pca but the reused engine is random").
+        if report.basis == "pca_corpus" and pca_engine is not None:
+            report.engine = pca_engine
+            # the route's recall/guarantee reflect the PCA engine (if measured)
+            if pca_recall == pca_recall:
                 route_recall = pca_recall
                 route_guarantees = list(pca_res["guarantees"])
                 route_pool_frac = (sum(1 for g in route_guarantees if g == "pool_only")
@@ -885,59 +1015,42 @@ class QualityValidator:
                     "exact_global": sum(1 for g in route_guarantees if g == "exact_global"),
                     "pool_only": sum(1 for g in route_guarantees if g == "pool_only"),
                 }
-                report.add(Flag(
-                    F_FOLDABLE, PASS,
-                    f"random basis proved only {bound_frac:.0%} (loose at "
-                    f"d={d}), but the PCA basis PROVED {pca_proved:.0%} with "
-                    f"seed recall {pca_recall:.3f} vs search_exact — the "
-                    "corpus is foldable under a tight basis AND the recall "
-                    "holds; basis=pca_corpus restores proof-based pruning.",
-                    metric=pca_proved, threshold=0.50))
-            elif (pca_proved is not None and pca_proved >= 0.50
-                  and pca_recall == pca_recall and pca_recall < self.recall_floor):
-                # PCA "proves" the corpus but DEGRADES recall → false manifold.
-                # Reverse to random/k1-high; flag as FAIL (router must not pick
-                # a base that loses recall).
-                report.basis = "random"
-                report.k1_fraction = 0.20
-                report.engine = eng_random
-                report.stage1_dim = s1
-                route_recall = mean_recall
-                route_guarantees = list(guarantees)
-                route_pool_frac = pool_only_frac
-                report.add(Flag(
-                    F_FOLDABLE, WARN,
-                    f"PCA basis proved {pca_proved:.0%} BUT degraded seed "
-                    f"recall to {pca_recall:.3f} (< floor {self.recall_floor:.2f}) "
-                    "— the PCA is capturing corruption/noise, not a real "
-                    "manifold (e(v)≈0 is a false positive). Reversing to "
-                    "random/k1=0.20; the prefilter is the recall gate.",
-                    metric=pca_proved, threshold=0.50))
-                # recorder the metrics for the chosen (random) route
-                self._flag_recall_shortfall(report, pca_recall,
-                                            (sum(1 for g in pca_res["guarantees"] if g == "pool_only")
-                                             / len(pca_res["guarantees"]) if pca_res["guarantees"] else 0.0),
-                                            pca_res["guarantees"],
-                                            self.recall_floor, route="pca_corpus")
-            else:
-                report.basis = "random"
-                report.k1_fraction = 0.20
-                report.engine = eng_random
-                report.stage1_dim = s1
-                route_recall = mean_recall
-                route_guarantees = list(guarantees)
-                route_pool_frac = pool_only_frac
-                reason = (f"PCA basis proved only {pca_proved:.0%}" if pca_proved is not None
-                          else "PCA probe skipped")
-                report.add(Flag(
-                    F_FOLDABLE, WARN,
-                    f"Cauchy-Schwarz proved only {bound_frac:.0%} of the corpus "
-                    f"(prefilter heuristic {pre_frac:.0%}; {reason}) — the "
-                    "bound is loose here and the PREFILTER is the real recall "
-                    "gate. k1_fraction raised to 0.20.",
-                    metric=bound_frac, threshold=0.20))
+        elif report.basis == "pca_corpus":
+            # pca route but no pca probe ran (bound_frac >= 0.50 fired first):
+            # report.engine stays None → build_quality_engine builds a REAL pca.
+            report.engine = None
+            route_recall = mean_recall
+            route_guarantees = list(guarantees)
+            route_pool_frac = pool_only_frac
+        else:
+            report.engine = eng_random
+            route_recall = mean_recall
+            route_guarantees = list(guarantees)
+            route_pool_frac = pool_only_frac
 
-        # 3) embedding resolution (the third-party quality): if even the top-K
+        # Describe the applied route (foldable flag is informational).
+        if report.basis == "pca_corpus":
+            report.add(Flag(
+                F_FOLDABLE, PASS,
+                f"route table chose basis=pca_corpus, k1={report.k1_fraction} "
+                f"(random bound_frac={bound_frac:.0%}, pca bound_frac="
+                f"{pca_proved:.0%}, pca seed recall "
+                f"{pca_recall if pca_recall is not None else float('nan'):.3f}).",
+                metric=bound_frac,
+                threshold=_FOLD_BOUND_FRAC if bound_frac >= _FOLD_BOUND_FRAC
+                else _FOLD_BOUND_FRAC_LOW))
+        else:
+            reason = ("route table chose random" if not has_nan
+                      else "nan_policy=block_pca")
+            report.add(Flag(
+                F_FOLDABLE,
+                WARN if bound_frac < _FOLD_BOUND_FRAC_LOW else PASS,
+                f"{reason}: basis=random, k1={report.k1_fraction} "
+                f"(random bound_frac={bound_frac:.0%}, prefilter "
+                f"{pre_frac:.0%}).",
+                metric=bound_frac, threshold=_FOLD_BOUND_FRAC_LOW))
+
+        # 3c) embedding resolution (the third-party quality): if even the top-K
         #    are barely more similar than the top-1, the provider's embeddings
         #    have poor semantic discrimination. WARN by default; escalated to
         #    FAIL when fail_on_resolution is set (Phase 2 / GAIA: a hard floor
@@ -951,20 +1064,18 @@ class QualityValidator:
                 "bounded by the provider's quality, not the engine.",
                 metric=mean_gap, threshold=0.10))
 
-        # 4) RECALL VALIDATION of the FINAL suggested route (2026-09-04): every
-        #    branch above set report.basis/k1 and route_recall/route_guarantees
-        #    (the recall/guarantee of the engine it SUGGESTS — pca when the
-        #    validated probe chose pca, random otherwise). Expose the honest
-        #    scope: pool_only vs exact_global + measured seed recall. If the
-        #    chosen route has recall below the floor, flag it — never hide
-        #    recall<1.0 with viol=0.
+        # 4) RECALL VALIDATION of the FINAL applied route (2026-09-04): the
+        #    route_recall/route_guarantees above reflect the engine that the
+        #    config's route table CHOSE (pca when the pca route won, random
+        #    otherwise). Expose the honest scope: pool_only vs exact_global +
+        #    measured seed recall. If the applied route has recall below the
+        #    floor, flag it (WARN) — never hide recall<1.0 with viol=0. The
+        #    code does NOT reverse the route; that is the config's call.
         self._flag_recall_shortfall(report, route_recall, route_pool_frac,
                                     route_guarantees, self.recall_floor,
                                     route=report.basis)
 
         report.excluded_seed_set = captured
-        # stage1_dim: keep the probe's value when the PCA route was chosen (the
-        # branch already set report.stage1_dim=s1p); the random branches set s1.
         return report
 
 
@@ -1016,6 +1127,12 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
         engine_kwargs=preset_engine,
         pca_iterations=int(preset_engine.get("pca_iterations", 30)),
         nan_policy=qc.nan_policy,
+        nan_blocked_route=qc.nan_blocked_route,
+        recall_floor=qc.recall_floor,
+        route_rules=qc.route_rules,
+        stage1_probe_random=qc.stage1_probe_random,
+        stage1_probe_pca=qc.stage1_probe_pca,
+        probe_pca_dim_gate=qc.probe_pca_dim_gate,
     )
     return validator.validate(corpus, dim=dim, reference=reference, provider=provider)
 
@@ -1064,18 +1181,35 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
         "early_exit": report.early_exit,
         "k": k,
     }
-    # nan_policy='block_pca': o basis FORÇADO (do preset ou do chamador) não
-    # pode contornar a proteção — pca_corpus sobre corpus NaN amplifica a
-    # corrupção (medido: recall 0.042 vs random 1.0). O roteador já forçou
-    # random; aqui garantimos que um basis vindo de engine_kwargs não reforce
-    # pca_corpus por cima da decisão da política.
+    # nan_policy='block_pca' (a SAFETY policy of the config): the validator
+    # already applied nan_blocked_route to report.basis when NaN is present.
+    # This second guard makes the policy airtight at the build boundary: even a
+    # preset/caller engine_kwargs that FORCES pca_corpus / a low k1 cannot
+    # override the NaN block — pca over NaN amplifies corruption (measured
+    # recall 0.042), and a random route needs its safe k1 (the prefilter is the
+    # recall gate on a degraded corpus). The nan_blocked_route is the config's
+    # policy; the code only enforces it.
     nan_frac = float(report.metrics.get("nan_fraction", 0.0))
     nan_blocked = nan_frac > 0.0 and (cfg.nan_policy if cfg is not None else "block_pca") == "block_pca"
     if nan_blocked:
-        for kw in ("basis",):
-            caller_kwargs = dict(caller_kwargs)
-            caller_kwargs[kw] = "random"
+        nb_route = cfg.nan_blocked_route if cfg is not None else _NAN_BLOCKED_ROUTE
+        caller_kwargs = dict(caller_kwargs)
+        caller_kwargs["basis"] = nb_route.get("basis", "random")
+        caller_kwargs["k1_fraction"] = nb_route.get("k1_fraction", 0.20)
     build_kwargs.update({kk: vv for kk, vv in caller_kwargs.items() if vv is not None})
+
+    # REPORT ↔ FINAL CONFIG sync (2026-09-04): the report's suggested_config
+    # must reflect the engine config that will ACTUALLY be built. The route
+    # table picked basis/k1/stage1 from the measured signals, but the preset's
+    # engine_kwargs (operator overrides) may pin different values on top. Update
+    # the report so it is consistent with the engine — no more "report says
+    # stage1=64, engine uses 128".
+    report.basis = str(build_kwargs.get("basis", report.basis))
+    report.k1_fraction = float(build_kwargs.get("k1_fraction", report.k1_fraction))
+    report.stage1_dim = int(build_kwargs.get("stage1_dim", report.stage1_dim))
+    report.quant = str(build_kwargs.get("quant", report.quant))
+    report.stage2_dim = int(build_kwargs.get("stage2_dim", report.stage2_dim))
+    report.early_exit = bool(build_kwargs.get("early_exit", report.early_exit))
 
     # SCAN INT8 AUTOMÁTICO e AGNÓSTICO (2026-09-03, normalize 1.3.0):
     # o motor (madhava 1.9.11) ganhou scan_int8 (quantiza as projeções do

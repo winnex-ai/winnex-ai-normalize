@@ -5,6 +5,55 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-09-04
+
+### Changed: routing policy moved from CODE to CONFIG (`route_rules`) — the router is now agnostic
+
+**Motivação (diretriz):** *"o sistema deve ser agnóstico; a responsabilidade é do
+config, jamais ajustar para um dataset no código."* O router do `QualityValidator`
+decidia basis/k1/stage1 por **ifs fixos no código** (`bound_frac >= 0.50 → pca/k1=0.05`,
+`0.20–0.50 → random/k1=0.10`, `< 0.20 → probe ...`). Trocar política exigia editar
+código — o oposto de agnóstico. A validação de recall do 1.3.0 adicionou MAIS
+regras fixas (reversão de pca por recall). Esta versão move a **decisão** para o
+config e mantém o código como **medidor + aplicador**.
+
+**O que NÃO mudou (é sinal legítimo do código):** o validator MEDE e EXPÕE —
+`bound_fraction`, `bound_fraction_pca`, `seed_recall_vs_exact`,
+`pool_only_frac`, `recall_guarantee`, `prefilter_fraction`, flags de integridade.
+Isto é agnóstico: vale para qualquer dado.
+
+**Mudanças:**
+
+1. **`QualityConfig.route_rules`** (nova): a TABELA de decisão que mapeia sinais
+   medidos → rota do motor (basis / k1_fraction / stage1_dim). Vive no preset
+   JSON (`quality.route_rules` no `dataset_default.json`). Formato:
+   `[{"when": {metric: ">= 0.50"}, "route": {basis, k1_fraction}}, ..., {"fallback": {...}}]`.
+   A primeira regra cujo `when` casa vence; o fallback cobre o resto. Suporta
+   `>=, >, <=, <, ==` sobre as chaves de `report.metrics`. A tabela default
+   **reproduz o comportamento histórico exato** → callers existentes não mudam.
+2. **`QualityValidator` vira medidor + aplicador**: mede os sinais (probes random
+   + PCA) e aplica `_match_route(report.metrics, route_rules, recall_floor)`. Os
+   `if bound_frac...` de decisão foram REMOVIDOS (0 restantes). O código não
+   decide rota — aplica a política do config.
+3. **`recall_floor` deixa de reverter no código**: o 1.3.0 revertia pca→random no
+   código quando recall < floor. Agora a flag `dataset.recall_not_guaranteed` é
+   um SINAL (WARN). Reverter/evitar pca por recall baixo é uma regra explícita
+   na `route_rules` do config (se o operador quiser), não código.
+4. **`nan_blocked_route`** (nova, no config): quando `nan_policy=block_pca`, a
+   rota de segurança aplicada (random/k1=0.20) vem do config, não de um valor
+   fixo no código.
+5. **Knobs de probe externalizados**: `stage1_probe_random` (era `min(64,d)`),
+   `stage1_probe_pca` (era `min(192,d)`), `probe_pca_dim_gate` (era `d>64`).
+6. **Report ↔ engine consistente**: o `build_quality_engine` sincroniza o report
+   com a config final aplicada (basis/k1/stage1/quant) — corrige o bug onde o
+   report dizia stage1=64 mas o engine usava 128 (preset), e o caso onde o report
+   dizia pca_corpus mas o engine reutilizado era random.
+
+**Validação:** 48/48 testes passam (4 novos: route_rules default reproduz
+comportamento; route_rules muda a rota via config; `_match_route` condições;
+recall_shortfall é sinal WARN, não decisão). Benchmark Kaggle (dry-run) PASS com
+a tabela default.
+
 ## [1.3.0] — 2026-09-04
 
 ### Added: automatic agnostic `scan_int8` — validated by real recall, not heuristics
