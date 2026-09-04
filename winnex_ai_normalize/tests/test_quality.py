@@ -35,6 +35,7 @@ from winnex_ai_normalize.core.quality import (
     F_CROSS_PROVIDER,
     F_DIM_SHIFT,
     F_COLLAPSE,
+    F_RECALL,
 )
 
 
@@ -479,3 +480,130 @@ def test_nan_policy_from_dataset_preset():
     # preset desconhecido → default (block_pca)
     cfg = QualityConfig.from_dataset("nao_existe")
     assert cfg.nan_policy == "block_pca"
+
+
+# ---------------------------------------------------------------------------
+# RECALL VALIDATION (2026-09-04): validate the router by REAL recall (search vs
+# the motor's own search_exact), not by bound coverage alone. Expose
+# recall_guarantee (pool_only | exact_global) on the report. This is the honest
+# fix for the silent collapse: a config with viol=0 can be pool_only with
+# recall < 1.0 (measured: word2vec-like weak manifold → 0.75 with pool_only).
+# ---------------------------------------------------------------------------
+
+def _weak_manifold(n=941, d=300, ncomp=200, seed=0):
+    """word2vec-like weak manifold (ncomp ≈ d): the bound on a random basis is
+    loose (proves ~0%), the prefilter is the real recall gate, and the returned
+    top-K is pool_only — the documented silent-collapse regime."""
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n, ncomp)) @ rng.standard_normal((ncomp, d))
+    X = X.astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    return X
+
+
+def test_report_exposes_seed_recall_and_guarantee():
+    """The report carries the honest scope of the suggested config: the mean
+    seed recall (search vs the motor's own search_exact) and the pool_only /
+    exact_global counts. Before this fix the router reported only bound
+    coverage — recall<1.0 with viol=0 was invisible."""
+    X = _weak_manifold()
+    rep = audit_corpus(X, dim=300, n_seed_queries=8)
+    m = rep.metrics
+    # the telemetry exists
+    assert "seed_recall_vs_exact" in m
+    assert "pool_only_frac" in m
+    assert "recall_guarantee_counts" in m
+    # the counts sum to the number of seed queries
+    c = m["recall_guarantee_counts"]
+    assert c["exact_global"] + c["pool_only"] == rep.metrics["seed_queries"]
+    # the values are real numbers (not nan)
+    assert m["seed_recall_vs_exact"] == m["seed_recall_vs_exact"]  # not nan
+
+
+def test_weak_manifold_recall_exposed_pool_only():
+    """On a weak manifold the recall of the random baseline is measurably < 1.0
+    and pool_only — the silent collapse is now VISIBLE, not hidden behind
+    viol=0. The router should either pick the PCA route that restores recall
+    (reporting its recall) or flag the random route."""
+    X = _weak_manifold()
+    rep = audit_corpus(X, dim=300, n_seed_queries=10)
+    m = rep.metrics
+    # either the pca route was chosen (recall 1.0, validated) or the random
+    # route was flagged. In BOTH cases pool_only_frac must be reported.
+    assert "pool_only_frac" in m
+    if rep.basis == "random":
+        # a random route on this manifold is pool_only with recall < floor
+        assert rep.k1_fraction >= 0.15
+        rflag = [f for f in rep.flags if f.code == F_RECALL]
+        assert rflag, "random route on a weak manifold must be flagged"
+    else:
+        # pca route: its recall must be high (validated, not assumed)
+        assert rep.basis == "pca_corpus"
+        assert m.get("seed_recall_vs_exact", 0) >= 0.9
+
+
+def test_recall_flag_on_pool_only_route():
+    """When the router keeps a pool_only random route with recall < floor, the
+    flag dataset.recall_not_guaranteed is emitted (WARN — weak manifold is a
+    physical limit, not corruption)."""
+    X = _weak_manifold()
+    rep = audit_corpus(X, dim=300, n_seed_queries=10, probe_pca=False)
+    assert rep.basis == "random"
+    rflags = [f for f in rep.flags if f.code == F_RECALL]
+    assert rflags, "a pool_only random route with recall < 1.0 must be flagged"
+    assert rflags[0].severity == WARN  # not FAIL: physical limit, not corruption
+
+
+def test_strong_manifold_recall_holds_pca():
+    """Regression: a strong manifold still routes pca_corpus and the validated
+    recall is 1.0 — the recall gate did NOT break good routing."""
+    X = _embeddings(n=3000, d=128, seed=0)  # low-rank + small noise = strong
+    rep = audit_corpus(X, dim=128, n_seed_queries=6)
+    assert rep.basis == "pca_corpus"
+    assert rep.metrics.get("seed_recall_vs_exact", 0) >= 0.95
+    # no FAIL recall flag on a strong manifold
+    assert not any(f.code == F_RECALL and f.severity == FAIL for f in rep.flags)
+
+
+def test_recall_floor_configurable_from_preset():
+    """recall_floor is an agnostic knob that travels in the preset JSON."""
+    from winnex_ai_normalize.core.quality import load_dataset_preset
+    cfg = QualityConfig.from_dataset("default")
+    assert cfg.recall_floor == 0.95
+    cfg2 = QualityConfig()  # default
+    assert cfg2.recall_floor == 0.95
+    # a preset override is honored
+    assert QualityConfig(recall_floor=0.9).recall_floor == 0.9
+
+
+def test_pca_route_with_low_recall_emits_fail():
+    """The reversal guard: when the PCA probe PROVES the corpus (high bound) but
+    its REAL seed recall drops below the floor, the route must NOT be pca_corpus
+    — the PCA is capturing corruption/noise (false manifold). The flag is FAIL
+    (the router must not suggest a base that loses recall). We unit-test the
+    guard directly because on CLEAN synthetic corpora PCA never degrades recall
+    (verified empirically: it either proves little or proves a lot with recall
+    1.0); the failure only fires on corrupted/noisy data, which we simulate by
+    driving the flag helper with a measured low pca recall."""
+    from winnex_ai_normalize.core.quality import QualityValidator, QualityReport
+    v = QualityValidator()
+    rep = QualityReport(n=100, dim=128)
+    v._flag_recall_shortfall(rep, 0.40, 1.0, ["pool_only"] * 8, 0.95,
+                             route="pca_corpus")
+    fails = [f for f in rep.flags if f.code == F_RECALL]
+    assert fails and fails[0].severity == FAIL
+    assert "DEGRADED" in fails[0].message or "below" in fails[0].message
+
+
+def test_random_route_with_low_recall_emits_warn_not_fail():
+    """A weak manifold that stays on the random route is a PHYSICAL limit (the
+    prefilter is the recall gate), not corruption — so the flag is WARN, and the
+    build is not blocked by default (the preset word2vec already lives here)."""
+    from winnex_ai_normalize.core.quality import QualityValidator, QualityReport
+    v = QualityValidator()
+    rep = QualityReport(n=100, dim=300)
+    v._flag_recall_shortfall(rep, 0.53, 1.0, ["pool_only"] * 6, 0.95,
+                             route="random")
+    warns = [f for f in rep.flags if f.code == F_RECALL]
+    assert warns and warns[0].severity == WARN
+    assert not rep.has_fail

@@ -123,11 +123,22 @@ F_NORM = "embedding.norm"                   # norm distribution abnormal
 F_COLLAPSE = "embedding.anisotropy"         # uint8-embedding trap / collapse
 F_ALIGN = "integrity.corpus_alignment"      # corpus vs reference misaligned
 F_GT_PROX = "integrity.query_corpus_proximity"  # query index collides with corpus
+F_RECALL = "dataset.recall_not_guaranteed"  # top-K is pool_only / recall<floor:
+                                            # the returned top-K is NOT the
+                                            # global top-K (silent collapse)
 
 # Defaults (calibrated against the engine's measured proof coverage).
 _FOLD_BOUND_FRAC = 0.50     # bound_frac ≥ this → strongly foldable
 _FOLD_BOUND_FRAC_LOW = 0.20  # bound_frac below this → probe/fold gate
 _RESOLUTION_GAP_WARN = 0.10  # top1-topK cos gap below this → weak embedding
+# RECALL VALIDATION (2026-09-04, the honest-scope fix): the router used to
+# decide by bound COVERAGE alone (pruned_by_bound/N). A config can have high
+# proof coverage yet pool_only recall < 1.0 (measured: word2vec-like weak
+# manifold, random k1=0.05 → recall 0.75 with viol=0, pool_only 20/20). We now
+# validate the REAL recall (search vs the motor's own search_exact) on the seed
+# queries and expose recall_guarantee. recall_floor is the minimum mean recall
+# a suggested config must meet; below it the config is flagged / reversed.
+_RECALL_FLOOR = 0.95
 
 
 @dataclass
@@ -169,6 +180,15 @@ class QualityConfig:
     #   "ignore"     → roda sem proteção (para medir a degradação / debug).
     nan_policy: str = "block_pca"
 
+    # RECALL FLOOR (2026-09-04): minimum mean seed recall@K (search vs the
+    # motor's own search_exact) a SUGGESTED config must meet. The router used
+    # to decide by bound coverage alone; a loose-bound config can be pool_only
+    # with recall < 1.0 and viol=0 (silent collapse). Below this floor the
+    # config is flagged `dataset.recall_not_guaranteed` and, for a PCA-suggested
+    # route, reversed to random/k1-high (the prefilter becomes the recall gate).
+    # Agnostic knob: lives in the preset JSON (quality.recall_floor), not code.
+    recall_floor: float = _RECALL_FLOOR
+
     # Config do MOTOR sugerida pelo preset do dataset (engine_kwargs aplicados
     # no build_engine). Vazia = agnóstica (o roteador decide pela prova).
     # Ex.: {"basis": "pca_corpus", "pca_iterations": 30, "stage1_dim": 128}
@@ -195,6 +215,7 @@ class QualityConfig:
             resolution_gap_warn=float(q.get("resolution_gap_warn", cls.resolution_gap_warn)),
             fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
             nan_policy=str(q.get("nan_policy", cls.nan_policy)),
+            recall_floor=float(q.get("recall_floor", cls.recall_floor)),
         )
         # engine_kwargs do preset: ignora valores null (o roteador decide).
         cfg.engine_kwargs = {k: v for k, v in eng.items() if v is not None}
@@ -429,13 +450,18 @@ class QualityValidator:
                  probe_pca: bool = True, engine_kwargs: Optional[dict] = None,
                  fail_on_resolution: bool = False,
                  pca_iterations: int = 30,
-                 nan_policy: str = "block_pca"):
+                 nan_policy: str = "block_pca",
+                 recall_floor: float = _RECALL_FLOOR):
         self.k = k
         self.n_seed_queries = n_seed_queries
         self.seed = seed
         self.probe_pca = probe_pca
         self.engine_kwargs = engine_kwargs or {}
         self.nan_policy = nan_policy
+        # RECALL FLOOR (2026-09-04): minimum mean seed recall@K (search vs the
+        # motor's own search_exact) a SUGGESTED config must meet; below it the
+        # config is flagged and (for a PCA route) reversed to random/k1-high.
+        self.recall_floor = float(recall_floor)
         # G1 FIX (2026-08-31): pca_iterations=30 como default (o knob vem do
         # preset dataset_default.json). O motor é agnóstico — o knob é do
         # chamador. 30 converge o subespaço dominante (subspace sim=1.0 vs 200,
@@ -465,11 +491,20 @@ class QualityValidator:
     def _run(self, eng, corpus, norms, dim, is_float, seed_idx, max_captured=1000):
         """Run the seed queries against the engine; capture the excluded set.
 
-        Returns (bound_count, prefilter_count, thresholds, gaps, captured).
+        Returns a dict with:
+            bound_count, prefilter_count, thresholds, gaps, captured
+            (as before) plus the RECALL validation (2026-09-04):
+            recalls: list[float] per seed query — recall@K of search() vs the
+                     motor's OWN search_exact() (the exact global top-K). This
+                     is what "validate the router by recall, not by bound"
+                     means: a config with high proof coverage can still be
+                     pool_only with recall < 1.0 (silent collapse), and only
+                     search_exact exposes it.
+            guarantees: list[str] per seed query — r.recall_guarantee
+                     ("pool_only" | "exact_global") from the motor.
         `gaps` is a list of dicts {seed_query, gap} — the per-query top-1 vs
         top-K exact cosine gap (Phase 2: exposed on QualityReport).
         """
-        import winnex_madhava as wm
         n = len(corpus)
         nq = len(seed_idx)
         total_bound = 0
@@ -477,12 +512,27 @@ class QualityValidator:
         thresholds: List[float] = []
         gaps: List[dict] = []
         captured: List[dict] = []
+        recalls: List[float] = []
+        guarantees: List[str] = []
         for qi in seed_idx:
             q = np.ascontiguousarray(corpus[qi], dtype=np.float32)
             r = eng.search(q)                       # the motor's own proof fires
             total_bound += int(r.pruned_by_bound)
             total_pre += int(r.pruned_by_prefilter)
             thresholds.append(float(r.audit_threshold))
+            guarantees.append(str(getattr(r, "recall_guarantee", "pool_only")))
+            # RECALL VALIDATION (2026-09-04): compare search() vs search_exact()
+            # — the motor's OWN exact global top-K. search_exact is the same
+            # operation the motor already uses as its ceiling (measured ~1.1-1.3x
+            # the search cost on seed queries), so this adds no reimplementation.
+            try:
+                rx = eng.search_exact(q)
+                g = set(int(i) for i in rx.indices)
+                if len(rx.indices) > 0:
+                    hit = sum(1 for i in r.indices if int(i) in g)
+                    recalls.append(hit / len(rx.indices))
+            except Exception:  # search_exact unavailable → recall unknown
+                recalls.append(float("nan"))
             # capture the excluded seed set (deterministic, bounded)
             for doc_id, ub in zip(r.audit_ids[:max_captured], r.audit_ubs[:max_captured]):
                 captured.append({
@@ -499,7 +549,54 @@ class QualityValidator:
                     c1 = float(corpus[r.indices[0]] @ q) / (norms[r.indices[0]] * qn)
                     ck = float(corpus[r.indices[-1]] @ q) / (norms[r.indices[-1]] * qn)
                     gaps.append({"seed_query": int(qi), "gap": c1 - ck})
-        return total_bound, total_pre, thresholds, gaps, captured
+        return {
+            "bound_count": total_bound,
+            "prefilter_count": total_pre,
+            "thresholds": thresholds,
+            "gaps": gaps,
+            "captured": captured,
+            "recalls": recalls,
+            "guarantees": guarantees,
+        }
+
+    @staticmethod
+    def _mean(xs):
+        """Mean of a float list, ignoring nan (search_exact unavailable)."""
+        f = [x for x in xs if x == x]
+        return float(np.mean(f)) if f else float("nan")
+
+    def _flag_recall_shortfall(self, report, mean_recall, pool_only_frac,
+                               guarantees, recall_floor, *, route=None):
+        """Emit `dataset.recall_not_guaranteed` when the suggested config is
+        pool_only or its measured seed recall is below the floor — the honest
+        exposure of the silent collapse (recall < 1.0 with viol=0). Severity:
+        WARN by default (weak manifold is a physical limit, not corruption);
+        FAIL when a PCA route was chosen yet recall dropped below the floor
+        (the router must NOT suggest pca_corpus that degrades recall).
+        """
+        if mean_recall != mean_recall:      # nan → search_exact unavailable
+            return
+        nq = len(guarantees)
+        n_pool = sum(1 for g in guarantees if g == "pool_only")
+        below = mean_recall < recall_floor
+        # pool_only alone is not a defect (the default IS pool_only when the
+        # bound is loose); what matters is whether the recall is < 1.0 in a way
+        # the router should flag. We flag when recall is measurably below floor
+        # OR when the operator would read "pass" while the top-K is pool_only
+        # with material recall loss.
+        if not below and not (pool_only_frac > 0.5 and mean_recall < 0.999):
+            return
+        sev = FAIL if (route == "pca_corpus" and below) else WARN
+        msg = (f"seed recall@K = {mean_recall:.3f} vs the motor's own "
+               f"search_exact (< floor {recall_floor:.2f}); "
+               f"{n_pool}/{nq} seed queries are recall_guarantee=pool_only — "
+               "the returned top-K is the best WITHIN the pool, NOT proven the "
+               "global top-K. viol=0 does not cover this (silent collapse). "
+               "For a global guarantee use audit_exhaustive=True or k1=N.")
+        if route == "pca_corpus" and below:
+            msg += " pca_corpus DEGRADED recall despite high bound coverage — reversing route."
+        report.add(Flag(F_RECALL, sev, msg, metric=mean_recall,
+                        threshold=recall_floor))
 
     def validate(self, corpus, dim: Optional[int] = None, *,
                  reference=None, provider: Optional[str] = None) -> QualityReport:
@@ -627,14 +724,28 @@ class QualityValidator:
             report.basis = "random"
             report.k1_fraction = 0.20
             return report
-        tb, tp, thr, gaps, captured = self._run(eng_random, arr, norms, d,
-                                                is_float, seed_idx)
+        res = self._run(eng_random, arr, norms, d, is_float, seed_idx)
+        tb = res["bound_count"]
+        tp = res["prefilter_count"]
+        thr = res["thresholds"]
+        gaps = res["gaps"]
+        captured = res["captured"]
+        recalls = res["recalls"]
+        guarantees = res["guarantees"]
         n_tot = n * n_seed
         bound_frac = tb / n_tot if n_tot else 0.0
         pre_frac = tp / n_tot if n_tot else 0.0
         proof_ratio = tb / max(tb + tp, 1)
         mean_thr = float(np.mean(thr)) if thr else 0.0
         mean_gap = float(np.mean([g["gap"] for g in gaps])) if gaps else 0.0
+        # RECALL VALIDATION (2026-09-04): mean recall of search() vs the motor's
+        # own search_exact() over the seed queries, and the fraction of seed
+        # queries whose returned top-K is pool_only (NOT the global top-K). This
+        # is the "validate by recall, not by bound" number.
+        _finite = [x for x in recalls if x == x]           # drop nan
+        mean_recall = float(np.mean(_finite)) if _finite else float("nan")
+        pool_only_frac = (sum(1 for g in guarantees if g == "pool_only") / len(guarantees)
+                          if guarantees else 0.0)
         report.metrics.update({
             "proof_ratio": proof_ratio,
             "bound_fraction": bound_frac,
@@ -643,10 +754,25 @@ class QualityValidator:
             "top1_topk_gap": mean_gap,
             "seed_queries": int(n_seed),
             "basis_probed": "random",
+            # recall telemetry (new)
+            "seed_recall_vs_exact": mean_recall,
+            "pool_only_frac": pool_only_frac,
         })
+        report.metrics["recall_guarantee_counts"] = {
+            "exact_global": sum(1 for g in guarantees if g == "exact_global"),
+            "pool_only": sum(1 for g in guarantees if g == "pool_only"),
+        }
         # Phase 2: expose the per-query resolution (top-1 vs top-K gap) so the
         # operator can route a "blurry" query to a stronger provider or block.
         report.query_resolution = [dict(g) for g in gaps]
+
+        # Recall telemetry of the FINAL route. Each branch below sets these to
+        # the seed recall/guarantees of the engine it SUGGESTS (random or pca),
+        # so the recall flag at the end reflects the config actually suggested,
+        # not the random baseline that may have been discarded by the probe.
+        route_recall = mean_recall
+        route_guarantees = list(guarantees)
+        route_pool_frac = pool_only_frac
 
         # 2) routing decision
         # nan_policy (knob do config, agnóstico): quando o corpus tem NaN/inf e
@@ -670,26 +796,40 @@ class QualityValidator:
             #  não afeta chamadas subsequentes do validator)
             report.excluded_seed_set = captured
             report.stage1_dim = s1
+            # RECALL VALIDATION: even the NaN-blocked random/k1=0.20 route can be
+            # pool_only with recall < 1.0 (silent collapse on a degraded corpus).
+            self._flag_recall_shortfall(report, mean_recall, pool_only_frac,
+                                        guarantees, recall_floor=self.recall_floor)
             return report
         if bound_frac >= 0.50:
             report.basis = "pca_corpus"
             report.k1_fraction = 0.05
             report.engine = eng_random
+            # random already proves ≥50% with recall ~1.0 (measured below); the
+            # suggested pca_corpus build tightens further — recall of this route
+            # is validated at the end against the FINAL engine.
+            route_recall = mean_recall
+            route_guarantees = list(guarantees)
+            route_pool_frac = pool_only_frac
             report.add(Flag(
                 F_FOLDABLE, PASS,
                 f"Cauchy-Schwarz PROVED {bound_frac:.0%} of the corpus is "
-                f"outside top-{self.k} (random basis) — the corpus is "
-                "foldable; basis=pca_corpus tightens the bound further.",
+                f"outside top-{self.k} (random basis, seed recall "
+                f"{mean_recall:.3f}) — the corpus is foldable; basis=pca_corpus "
+                "tightens the bound further.",
                 metric=bound_frac, threshold=0.50))
         elif bound_frac >= 0.20:
             report.basis = "random"
             report.k1_fraction = 0.10
             report.engine = eng_random
+            route_recall = mean_recall
+            route_guarantees = list(guarantees)
+            route_pool_frac = pool_only_frac
             report.add(Flag(
                 F_FOLDABLE, PASS,
                 f"Cauchy-Schwarz proved {bound_frac:.0%} of the corpus "
-                f"(prefilter {pre_frac:.0%}) — moderately foldable; "
-                "k1=0.10 keeps recall safe.",
+                f"(prefilter {pre_frac:.0%}, seed recall {mean_recall:.3f}) — "
+                "moderately foldable; k1=0.10 keeps recall safe.",
                 metric=bound_frac, threshold=0.20))
         else:
             # Loose bound on the random basis. Probe with the engine's OWN
@@ -697,20 +837,34 @@ class QualityValidator:
             # genuinely isotropic.
             pca_proved = None
             pca_engine = None
+            pca_recall = None
+            pca_res = None
             if self.probe_pca and d > 64:
                 try:
                     s1p = min(192, d)
                     eng_pca = self._build_engine(arr, d, metric, quant,
                                                  "pca_corpus", s1p)
-                    tb_p, _, _, _, _ = self._run(eng_pca, arr, norms, d,
-                                                 is_float, seed_idx)
-                    pca_proved = tb_p / n_tot if n_tot else 0.0
+                    pca_res = self._run(eng_pca, arr, norms, d,
+                                        is_float, seed_idx)
+                    pca_proved = pca_res["bound_count"] / n_tot if n_tot else 0.0
                     pca_engine = eng_pca
+                    pca_recall = self._mean(pca_res["recalls"])
                     report.metrics["bound_fraction_pca"] = pca_proved
+                    if pca_recall == pca_recall:
+                        report.metrics["seed_recall_vs_exact_pca"] = pca_recall
                     report.metrics["basis_probed"] = "random+pca_corpus"
                 except Exception as e:  # pragma: no cover
                     logger.warning(f"PCA probe failed ({e}) — keeping random")
-            if pca_proved is not None and pca_proved >= 0.50:
+            # RECALL-VALIDATED PCA ROUTE (2026-09-04): the probe must NOT be
+            # chosen by bound coverage alone. If the PCA basis PROVES a lot but
+            # its real recall (search vs search_exact) is below the floor, the
+            # PCA is capturing corruption/noise (e(v)≈0 is a false manifold) →
+            # do NOT route pca_corpus; fall back to random/k1-high (the
+            # prefilter becomes the recall gate). This is "validate the PCA
+            # probe by recall, not by bound".
+            pca_ok = (pca_proved is not None and pca_proved >= 0.50
+                      and pca_recall == pca_recall and pca_recall >= self.recall_floor)
+            if pca_ok:
                 report.basis = "pca_corpus"
                 report.k1_fraction = 0.05
                 report.engine = pca_engine
@@ -719,17 +873,60 @@ class QualityValidator:
                 # usaria stage1=64 (do random) em vez de 192 (do pca), e o
                 # cfg_match do build_quality_engine não reutilizaria o probe.
                 report.stage1_dim = s1p
+                # the FINAL route is the validated PCA build → recall/guarantee
+                # of the report reflect the PCA engine, not the discarded random.
+                route_recall = pca_recall
+                route_guarantees = list(pca_res["guarantees"])
+                route_pool_frac = (sum(1 for g in route_guarantees if g == "pool_only")
+                                   / len(route_guarantees) if route_guarantees else 0.0)
+                report.metrics["seed_recall_vs_exact"] = pca_recall
+                report.metrics["pool_only_frac"] = route_pool_frac
+                report.metrics["recall_guarantee_counts"] = {
+                    "exact_global": sum(1 for g in route_guarantees if g == "exact_global"),
+                    "pool_only": sum(1 for g in route_guarantees if g == "pool_only"),
+                }
                 report.add(Flag(
                     F_FOLDABLE, PASS,
                     f"random basis proved only {bound_frac:.0%} (loose at "
-                    f"d={d}), but the PCA basis PROVED {pca_proved:.0%} — the "
-                    "corpus is foldable under a tight basis; "
-                    "basis=pca_corpus restores proof-based pruning.",
+                    f"d={d}), but the PCA basis PROVED {pca_proved:.0%} with "
+                    f"seed recall {pca_recall:.3f} vs search_exact — the "
+                    "corpus is foldable under a tight basis AND the recall "
+                    "holds; basis=pca_corpus restores proof-based pruning.",
                     metric=pca_proved, threshold=0.50))
+            elif (pca_proved is not None and pca_proved >= 0.50
+                  and pca_recall == pca_recall and pca_recall < self.recall_floor):
+                # PCA "proves" the corpus but DEGRADES recall → false manifold.
+                # Reverse to random/k1-high; flag as FAIL (router must not pick
+                # a base that loses recall).
+                report.basis = "random"
+                report.k1_fraction = 0.20
+                report.engine = eng_random
+                report.stage1_dim = s1
+                route_recall = mean_recall
+                route_guarantees = list(guarantees)
+                route_pool_frac = pool_only_frac
+                report.add(Flag(
+                    F_FOLDABLE, WARN,
+                    f"PCA basis proved {pca_proved:.0%} BUT degraded seed "
+                    f"recall to {pca_recall:.3f} (< floor {self.recall_floor:.2f}) "
+                    "— the PCA is capturing corruption/noise, not a real "
+                    "manifold (e(v)≈0 is a false positive). Reversing to "
+                    "random/k1=0.20; the prefilter is the recall gate.",
+                    metric=pca_proved, threshold=0.50))
+                # recorder the metrics for the chosen (random) route
+                self._flag_recall_shortfall(report, pca_recall,
+                                            (sum(1 for g in pca_res["guarantees"] if g == "pool_only")
+                                             / len(pca_res["guarantees"]) if pca_res["guarantees"] else 0.0),
+                                            pca_res["guarantees"],
+                                            self.recall_floor, route="pca_corpus")
             else:
                 report.basis = "random"
                 report.k1_fraction = 0.20
                 report.engine = eng_random
+                report.stage1_dim = s1
+                route_recall = mean_recall
+                route_guarantees = list(guarantees)
+                route_pool_frac = pool_only_frac
                 reason = (f"PCA basis proved only {pca_proved:.0%}" if pca_proved is not None
                           else "PCA probe skipped")
                 report.add(Flag(
@@ -754,8 +951,20 @@ class QualityValidator:
                 "bounded by the provider's quality, not the engine.",
                 metric=mean_gap, threshold=0.10))
 
+        # 4) RECALL VALIDATION of the FINAL suggested route (2026-09-04): every
+        #    branch above set report.basis/k1 and route_recall/route_guarantees
+        #    (the recall/guarantee of the engine it SUGGESTS — pca when the
+        #    validated probe chose pca, random otherwise). Expose the honest
+        #    scope: pool_only vs exact_global + measured seed recall. If the
+        #    chosen route has recall below the floor, flag it — never hide
+        #    recall<1.0 with viol=0.
+        self._flag_recall_shortfall(report, route_recall, route_pool_frac,
+                                    route_guarantees, self.recall_floor,
+                                    route=report.basis)
+
         report.excluded_seed_set = captured
-        report.stage1_dim = s1
+        # stage1_dim: keep the probe's value when the PCA route was chosen (the
+        # branch already set report.stage1_dim=s1p); the random branches set s1.
         return report
 
 
@@ -961,6 +1170,53 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
                 engine = wm.build_engine(corpus, dim=dim, **build_kwargs)
         except Exception as _e:  # nunca quebrar o build por causa da validação
             logger.debug(f"scan_int8 validation skipped: {_e}")
+
+    # RECALL/GUARANTEE OF THE FINAL ENGINE (2026-09-04): regardless of whether
+    # the probe engine was reused or the final build happened above (basis may
+    # have been reversed by nan_policy or the recall floor; scan_int8 may have
+    # been toggled), measure the REAL seed recall of the engine being returned
+    # (search vs search_exact) and expose recall_guarantee on the report. This
+    # is the honest scope statement of the config the caller actually gets.
+    if engine is not None and return_report:
+        try:
+            import winnex_madhava as wm
+            _n = len(corpus)
+            _nseed = 6
+            _rng = np.random.default_rng(4242)
+            _idx = _rng.choice(max(1, _n), min(_nseed, _n), replace=False)
+            _recs = []
+            _guars = []
+            for _qi in _idx:
+                _q = np.ascontiguousarray(corpus[_qi], dtype=np.float32)
+                _r = engine.search(_q)
+                _rx = engine.search_exact(_q)
+                _guars.append(str(getattr(_r, "recall_guarantee", "pool_only")))
+                if len(_rx.indices) > 0:
+                    _g = set(int(i) for i in _rx.indices)
+                    _recs.append(sum(1 for i in _r.indices if int(i) in _g) / len(_rx.indices))
+            if _recs:
+                _mr = float(np.mean(_recs))
+                report.metrics["seed_recall_vs_exact_final"] = _mr
+            report.metrics["recall_guarantee_final"] = {
+                "exact_global": sum(1 for g in _guars if g == "exact_global"),
+                "pool_only": sum(1 for g in _guars if g == "pool_only"),
+            }
+            # Flag the FINAL config if it is measurably below the floor — the
+            # caller must see that the engine it received has recall < 1.0 with
+            # viol=0 (the honest exposure), even when the router did its best.
+            _floor = float(getattr(cfg, "recall_floor", _RECALL_FLOOR)) if cfg is not None else _RECALL_FLOOR
+            if _recs and _mr < _floor:
+                report.add(Flag(
+                    F_RECALL, WARN,
+                    f"final engine (basis={report.basis}, k1={report.k1_fraction}) "
+                    f"seed recall@K = {_mr:.3f} vs search_exact (< floor {_floor:.2f}); "
+                    f"{sum(1 for g in _guars if g == 'pool_only')}/{len(_guars)} "
+                    "queries pool_only — the returned top-K is NOT the global "
+                    "top-K. viol=0 does not cover this. Use audit_exhaustive=True "
+                    "or k1=N for a global guarantee.",
+                    metric=_mr, threshold=_floor))
+        except Exception as _e:  # nunca quebrar o build por causa da validação
+            logger.debug(f"final-engine recall validation skipped: {_e}")
 
     if return_report:
         return engine, report
