@@ -245,11 +245,8 @@ class QualityConfig:
     probe_pca: bool = True      # if random basis proves little, probe with
                                 # pca_corpus (the engine's own build) before
                                 # declaring the corpus non-foldable
-    fold_bound_frac: float = _FOLD_BOUND_FRAC
-    fold_bound_frac_low: float = _FOLD_BOUND_FRAC_LOW
-    resolution_gap_warn: float = _RESOLUTION_GAP_WARN
     # Phase 2 (GAIA): when True, a low embedding resolution (top-1 vs top-K
-    # cosine gap below resolution_gap_warn) is escalated from WARN to FAIL,
+    # cosine gap below _RESOLUTION_GAP_WARN) is escalated from WARN to FAIL,
     # blocking the build via QualityGateError. Default False — the current
     # behavior is unchanged (WARN only). Enable per-contract when the operator
     # wants a hard floor on embedding semantic quality ("blurry photo" guard).
@@ -336,9 +333,6 @@ class QualityConfig:
             k=int(q.get("k", cls.k)),
             n_seed_queries=int(q.get("n_seed_queries", cls.n_seed_queries)),
             probe_pca=bool(q.get("probe_pca", cls.probe_pca)),
-            fold_bound_frac=float(q.get("fold_bound_frac", cls.fold_bound_frac)),
-            fold_bound_frac_low=float(q.get("fold_bound_frac_low", cls.fold_bound_frac_low)),
-            resolution_gap_warn=float(q.get("resolution_gap_warn", cls.resolution_gap_warn)),
             fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
             nan_policy=str(q.get("nan_policy", cls.nan_policy)),
             recall_floor=float(q.get("recall_floor", cls.recall_floor)),
@@ -1056,14 +1050,15 @@ class QualityValidator:
         #    have poor semantic discrimination. WARN by default; escalated to
         #    FAIL when fail_on_resolution is set (Phase 2 / GAIA: a hard floor
         #    on embedding semantic quality, blocking via QualityGateError).
-        if mean_gap >= 0 and mean_gap < 0.10:
+        if mean_gap >= 0 and mean_gap < _RESOLUTION_GAP_WARN:
             sev = FAIL if self.fail_on_resolution else WARN
             report.add(Flag(
                 F_RESOLUTION, sev,
-                f"top-1 vs top-{self.k} exact-cosine gap {mean_gap:.3f} (< 0.10) "
-                "— the embedding set has low semantic resolution; recall is "
-                "bounded by the provider's quality, not the engine.",
-                metric=mean_gap, threshold=0.10))
+                f"top-1 vs top-{self.k} exact-cosine gap {mean_gap:.3f} "
+                f"(< {_RESOLUTION_GAP_WARN}) — the embedding set has low "
+                "semantic resolution; recall is bounded by the provider's "
+                "quality, not the engine.",
+                metric=mean_gap, threshold=_RESOLUTION_GAP_WARN))
 
         # 4) RECALL VALIDATION of the FINAL applied route (2026-09-04): the
         #    route_recall/route_guarantees above reflect the engine that the

@@ -5,6 +5,16 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] — 2026-09-06
+
+### Changed: cleanup — removed dead config knobs
+
+Removed `fold_bound_frac` / `fold_bound_frac_low` / `resolution_gap_warn` from
+`QualityConfig` and the default preset JSON. These fields were declared and
+loaded but never read — the validator used the module constants directly. The
+validator now references the module constants explicitly. No behavior change
+(all 49 tests pass).
+
 ## [1.4.1] — 2026-09-04
 
 ### Fixed: `build_quality_engine` crash when the route picks `pca_corpus` without a PCA probe
