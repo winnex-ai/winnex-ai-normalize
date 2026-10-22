@@ -664,7 +664,29 @@ class QualityValidator:
         guarantees: List[str] = []
         for qi in seed_idx:
             q = np.ascontiguousarray(corpus[qi], dtype=np.float32)
-            r = eng.search(q)                       # the motor's own proof fires
+            # BUG FIX (2026-10-21): the certificate must come from the motor's
+            # AUDITED search, not from the plain one.
+            #
+            # `search()` in winnex-madhava >= 1.9.15 (commit 63d1b6c) calls the
+            # C++ path with collect_audit=false for performance: it still COUNTS
+            # the exclusions (pruned_by_bound stays exact) but no longer
+            # MATERIALISES audit_ids/audit_ubs. The capture loop below reads
+            # those arrays, so after that release it captured an EMPTY set while
+            # the report kept claiming "proof_ratio 0.885". The timeline:
+            # the motor changed at 21:31:31 and this package was tagged 1.4.2 at
+            # 21:36:17 the same day, without re-running this path.
+            #
+            # `search_audited()` is the API that explicitly requests the
+            # per-document certificate ("that ~O(N) cost is paid only by
+            # search_audited/commitment, which request it explicitly"). The
+            # Python binding returns a dict: indices, latency_ms,
+            # bound_violations, bound_pairs, audit_candidates, audit_excluded,
+            # audit. The per-document records are the authoritative source, so
+            # the capture is built from `audit` and the counts from the dict.
+            aud = eng.search_audited(q, k=int(self.k),
+                                     max_audit_records=int(max_captured))
+            audit_records = aud["audit"] if isinstance(aud, dict) else []
+            r = eng.search(q)          # plain search: pruned_by_* / thresholds
             total_bound += int(r.pruned_by_bound)
             total_pre += int(r.pruned_by_prefilter)
             thresholds.append(float(r.audit_threshold))
@@ -681,14 +703,21 @@ class QualityValidator:
                     recalls.append(hit / len(rx.indices))
             except Exception:  # search_exact unavailable → recall unknown
                 recalls.append(float("nan"))
-            # capture the excluded seed set (deterministic, bounded)
-            for doc_id, ub in zip(r.audit_ids[:max_captured], r.audit_ubs[:max_captured]):
+            # Capture the excluded seed set from the AUDIT RECORDS — the
+            # motor's per-document certificate — rather than from the
+            # now-unpopulated r.audit_ids. Only records the motor marked
+            # `excluded` are evidence; the in_topk ones are not.
+            for rec in audit_records:
+                if not rec.get("excluded", False):
+                    continue
                 captured.append({
-                    "doc_id": int(doc_id),
-                    "upper_bound": float(ub),
-                    "threshold": float(r.audit_threshold),
+                    "doc_id": int(rec["doc_id"]),
+                    "upper_bound": float(rec["upper_bound"]),
+                    "threshold": float(rec["threshold"]),
                     "seed_query": int(qi),
                 })
+                if len(captured) >= max_captured:
+                    break
             # embedding resolution: top-1 vs top-K exact cosine. Exposed per
             # query so a "blurry" query is distinguishable from a good one.
             if is_float and len(r.indices) >= 2 and norms is not None:
