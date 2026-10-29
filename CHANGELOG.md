@@ -5,6 +5,59 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.4] — 2026-10-29
+
+### Fixed: `fail_on_recall` — o gate não podia bloquear por recall
+
+O gate tratava dois sinais de qualidade de forma assimétrica:
+
+  F_RESOLUTION (qualidade do embedding)  escala para FAIL via `fail_on_resolution`
+  F_RECALL     (recall abaixo do piso)   era WARN hardcoded
+
+O docstring de `_flag_recall_shortfall` dizia que a política de bloqueio
+"pertence ao config (route_rules / recall_floor / fail thresholds)" — mas o knob
+que a materializaria nunca existiu. `QualityValidator.__init__` aceitava
+`fail_on_resolution` e nunca `fail_on_recall`, e `QualityConfig` não tinha o
+campo. O gate não podia bloquear por recall, por construção.
+
+Por que isso importa: o certificado do Madhava atesta que nada foi descartado
+indevidamente DENTRO do pool. Com recall em 0,50 e o gate deixando passar, o
+operador recebe `bound_violations = 0` sobre um top-K que não é o global, e
+nenhum sinal bloqueia.
+
+Adicionado, espelhando `fail_on_resolution` de ponta a ponta:
+
+  QualityConfig.fail_on_recall       (default False, compatível com a frente)
+  QualityConfig.from_dict            lê do preset JSON do dataset
+  QualityValidator.__init__          aceita o parâmetro
+  _flag_recall_shortfall             escala para FAIL quando abaixo do piso
+
+Só perda MATERIAL bloqueia: recall abaixo do piso. O caso pool_only com
+recall < 1,0 mas >= piso continua WARN mesmo com o knob ligado — bloquear ali
+seria bloquear o default do próprio motor.
+
+Verificado nos dois sentidos com piso impossível (1,01):
+  fail_on_recall=True  -> QualityGateError, FAIL: dataset.recall_not_guaranteed
+  fail_on_recall=False -> build succeeds (controle)
+
+### Fixed: versão dessincronizada
+
+`pyproject.toml` declarava 1.4.3 e `winnex_ai_normalize.__version__` dizia
+1.4.2 desde a 1.4.3 — o mesmo defeito de duas fontes de verdade corrigido no
+winnex-tracer. Ambos agora em 1.4.4.
+
+Tests: 4 novos em tests/test_quality.py (knob existe, propaga do config,
+escala para FAIL, e o controle não bloqueia). Suite: 53 passed.
+
+## [1.4.3] — 2026-09-07
+
+### Fixed: certificado vem do `search_audited`, não do `search`
+
+O caminho de captura do certificado usava `search()`, que não popula
+`audit_ids` (é o caminho rápido, sem coleta por documento). O resultado era um
+certificado sempre vazio assinado como se fosse válido. Agora usa
+`search_audited`, que materializa o registro por documento excluído.
+
 ## [1.4.2] — 2026-09-06
 
 ### Changed: cleanup — removed dead config knobs

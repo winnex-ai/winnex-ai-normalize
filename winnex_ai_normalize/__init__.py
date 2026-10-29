@@ -48,7 +48,7 @@ from .core.quality import (
     load_dataset_preset,
 )
 
-__version__ = "1.4.2"
+__version__ = "1.4.4"
 
 __all__ = [
     "NormalizeConfig",
