@@ -737,3 +737,50 @@ def test_sem_fail_on_recall_nao_bloqueia():
     cfg = QualityConfig(fail_on_recall=False, recall_floor=1.01)
     eng = build_quality_engine(X, dim=128, k=10, cfg=cfg, allow_unsafe=False)
     assert eng is not None
+
+
+# ---------------------------------------------------------------------------
+# stage1_dim do preset precisa ser clampado em d (2026-10-29)
+# ---------------------------------------------------------------------------
+def test_stage1_do_preset_e_clampado_em_d():
+    """dataset_arxiv fixa stage1_dim=128; num corpus de d=64 isso invalida o bound.
+
+    Os dois probes já faziam min(probe, d), mas a atribuição que o preset JSON
+    controla não fazia. Com a validação do Madhava (stage1_dim > dim recusado),
+    o preset passaria a levantar; antes dela, passava um bound inválido adiante
+    (medido: UB/exato = 2,0 e bound_violations > 0).
+    """
+    import numpy as np
+    from winnex_ai_normalize.core.quality import QualityConfig, audit_corpus
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(600, 64)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    cfg = QualityConfig(route_rules=[
+        {"when": {"bound_fraction": ">= 0.0"},
+         "route": {"basis": "random", "stage1_dim": 128,
+                   "k1_fraction": 0.2}}])
+    rep = audit_corpus(X, dim=64, cfg=cfg)
+    assert rep.stage1_dim <= 64, (
+        f"stage1_dim={rep.stage1_dim} > d=64 — o bound seria inválido")
+    assert rep.metrics.get("stage1_dim_clamped_from") == 128, (
+        "o valor original precisa ficar registrado, não sumir")
+
+
+def test_stage1_do_preset_menor_que_d_nao_muda():
+    """Controle: se o preset cabe em d, nada é alterado."""
+    import numpy as np
+    from winnex_ai_normalize.core.quality import QualityConfig, audit_corpus
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(600, 256)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    cfg = QualityConfig(route_rules=[
+        {"when": {"bound_fraction": ">= 0.0"},
+         "route": {"basis": "random", "stage1_dim": 64,
+                   "k1_fraction": 0.2}}])
+    rep = audit_corpus(X, dim=256, cfg=cfg)
+    assert rep.stage1_dim == 64
+    assert "stage1_dim_clamped_from" not in rep.metrics

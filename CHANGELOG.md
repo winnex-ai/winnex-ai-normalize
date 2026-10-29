@@ -5,6 +5,32 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.5] — 2026-10-29
+
+### Fixed: `stage1_dim` do preset não era clampado em `d`
+
+`dataset_arxiv.json` fixa `stage1_dim = 128`. Os dois probes do validador já
+faziam `min(probe, d)`, mas a atribuição que o preset JSON controla
+(`report.stage1_dim = int(route_stage1)`) não fazia.
+
+O que isso causava: num corpus de `d < 128`, o preset passava `stage1_dim=128`
+adiante. Desde a validação do Madhava (2026-10-29, `stage1_dim > dim` recusado
+com `invalid_argument`), o preset passaria a levantar. Antes dela, o motor
+aceitava e produzia um bound INVÁLIDO — medido num corpus de d=64:
+`UB/exato = 2,008` e `bound_violations > 0`, com o certificado atestando um
+descarte que o motor não provou.
+
+Correção: `stage1_dim = min(route_stage1, d)`, com o valor original registrado
+em `report.metrics["stage1_dim_clamped_from"]` para não sumir.
+
+O clamp aqui não é degradação silenciosa: `stage1_dim > d` não tem significado
+matemático — não existem mais de `d` vetores ortonormais em ℝ^d. Truncar para
+`d` é a maior projeção que ainda respeita o bound, e é o que um preset
+"stage1 = 128" quer dizer num corpus menor.
+
+Tests: 2 novos (clamp aplicado com o valor original registrado, e o controle
+onde o preset cabe em d e nada muda). Suite: 48 passed.
+
 ## [1.4.4] — 2026-10-29
 
 ### Fixed: `fail_on_recall` — o gate não podia bloquear por recall

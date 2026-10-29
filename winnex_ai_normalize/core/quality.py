@@ -1041,7 +1041,21 @@ class QualityValidator:
         # random-probe dim (s1) or the pca-probe dim when pca was chosen.
         route_stage1 = route_knobs.get("stage1_dim")
         if route_stage1 is not None:
-            report.stage1_dim = int(route_stage1)
+            # CLAMP em d (2026-10-29). Os DOIS probes já faziam min(probe, d),
+            # mas esta atribuição — a que o preset JSON controla — não fazia.
+            # dataset_arxiv.json fixa stage1_dim=128: rodá-lo num corpus de d<128
+            # passava 128 adiante, e o Madhava (a partir da validação de
+            # 2026-10-29) recusa stage1_dim > dim com invalid_argument.
+            #
+            # O clamp aqui é a correção certa e não uma degradação silenciosa:
+            # stage1_dim > d NÃO tem significado — não existem mais de d vetores
+            # ortonormais em R^d, e o bound deixa de ser válido (medido: UB/exato
+            # = 2,0 e bound_violations > 0). Truncar para d é a maior projeção
+            # que ainda respeita o bound, e é o que um preset "stage1 = 128" quer
+            # dizer num corpus menor.
+            report.stage1_dim = min(int(route_stage1), int(d))
+            if report.stage1_dim < int(route_stage1):
+                report.metrics["stage1_dim_clamped_from"] = int(route_stage1)
         elif report.basis == "pca_corpus" and pca_engine is not None:
             report.stage1_dim = s1p
         else:
