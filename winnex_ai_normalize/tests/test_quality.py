@@ -681,3 +681,59 @@ def test_foldable_flag_pca_without_probe_no_crash():
     assert rep.basis == "pca_corpus"
     # the F_FOLDABLE flag must be present and well-formed (no crash)
     assert any(f.code == F_FOLDABLE for f in rep.flags)
+
+
+# ---------------------------------------------------------------------------
+# Gate: fail_on_recall espelha fail_on_resolution (2026-10-29)
+# ---------------------------------------------------------------------------
+def test_fail_on_recall_config_exists():
+    """O knob que o docstring de `_flag_recall_shortfall` prometia existir.
+
+    Antes: `F_RECALL` era WARN hardcoded, então o gate não podia bloquear por
+    recall por construção — e um registro `bound_violations=0` podia
+    acompanhar um top-K que não é o global, sem nenhum sinal bloqueante.
+    """
+    from winnex_ai_normalize.core.quality import QualityConfig
+    cfg = QualityConfig()
+    assert hasattr(cfg, "fail_on_recall")
+    assert cfg.fail_on_recall is False          # default preserva o histórico
+
+
+def test_fail_on_recall_propaga_do_config():
+    """O valor do config chega ao validator (o elo que faltava)."""
+    from winnex_ai_normalize.core.quality import QualityConfig, QualityValidator
+    cfg = QualityConfig(fail_on_recall=True, recall_floor=0.99)
+    v = QualityValidator(fail_on_recall=cfg.fail_on_recall,
+                         recall_floor=cfg.recall_floor)
+    assert v.fail_on_recall is True
+    assert v.recall_floor == 0.99
+
+
+def test_fail_on_recall_escala_para_fail():
+    """Com piso impossível e fail_on_recall, o flag é FAIL e bloqueia."""
+    import numpy as np
+    from winnex_ai_normalize.core.quality import (
+        QualityConfig, QualityGateError, build_quality_engine,
+    )
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(4000, 128)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    cfg = QualityConfig(fail_on_recall=True, recall_floor=1.01)
+    with pytest.raises(QualityGateError):
+        build_quality_engine(X, dim=128, k=10, cfg=cfg, allow_unsafe=False)
+
+
+def test_sem_fail_on_recall_nao_bloqueia():
+    """Controle: o mesmo cenário com o knob desligado NÃO bloqueia."""
+    import numpy as np
+    from winnex_ai_normalize.core.quality import (
+        QualityConfig, build_quality_engine,
+    )
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(4000, 128)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    cfg = QualityConfig(fail_on_recall=False, recall_floor=1.01)
+    eng = build_quality_engine(X, dim=128, k=10, cfg=cfg, allow_unsafe=False)
+    assert eng is not None

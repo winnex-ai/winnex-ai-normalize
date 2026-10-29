@@ -282,6 +282,25 @@ class QualityConfig:
     # entry in the preset JSON, not code. Agnostic knob.
     recall_floor: float = _RECALL_FLOOR
 
+    # Espelho de `fail_on_resolution`, para o sinal de RECALL (2026-10-29).
+    #
+    # O gate tratava dois sinais de qualidade de forma assimétrica: a
+    # resolução do embedding escalava para FAIL quando `fail_on_resolution`,
+    # mas `F_RECALL` era WARN hardcoded (ver `_flag_recall_shortfall`). O
+    # docstring daquela função dizia que "a política pertence ao config" —
+    # mas o knob que a materializaria nunca existiu, então o gate NÃO PODIA
+    # bloquear por recall, por construção.
+    #
+    # Por que é grave: o certificado do Madhava atesta que nada foi
+    # descartado indevidamente DENTRO do pool. Com recall de 0,50 e o gate
+    # deixando passar, o operador recebe `bound_violations = 0` sobre um
+    # top-K que não é o global, e nenhum sinal bloqueia. É a erosão silenciosa
+    # exata que o resto da stack combate.
+    #
+    # Default False preserva o comportamento atual; ligue para ter piso duro
+    # de recall, espelhando o que `fail_on_resolution` já faz.
+    fail_on_recall: bool = False
+
     # Stage-1 probe dimensions (2026-09-04): the dimensions the QUALITY
     # VALIDATOR uses to MEASURE the corpus signals (bound coverage under a
     # random basis and, optionally, a PCA basis). These are MEASUREMENT knobs,
@@ -336,6 +355,7 @@ class QualityConfig:
             fail_on_resolution=bool(q.get("fail_on_resolution", cls.fail_on_resolution)),
             nan_policy=str(q.get("nan_policy", cls.nan_policy)),
             recall_floor=float(q.get("recall_floor", cls.recall_floor)),
+            fail_on_recall=bool(q.get("fail_on_recall", cls.fail_on_recall)),
             # route_rules + probe knobs (2026-09-04): a política de roteamento e
             # as dimensões de PROBE vêm do preset JSON — o código não decide.
             route_rules=list(q.get("route_rules") or _DEFAULT_ROUTE_RULES),
@@ -583,6 +603,7 @@ class QualityValidator:
     def __init__(self, k: int = 10, n_seed_queries: int = 8, seed: int = 42,
                  probe_pca: bool = True, engine_kwargs: Optional[dict] = None,
                  fail_on_resolution: bool = False,
+                 fail_on_recall: bool = False,
                  pca_iterations: int = 30,
                  nan_policy: str = "block_pca",
                  nan_blocked_route: Optional[dict] = None,
@@ -610,6 +631,10 @@ class QualityValidator:
         # floor the config is flagged (WARN) — the code does NOT reverse the
         # route; the policy for "never pca when recall < floor" is the config's.
         self.recall_floor = float(recall_floor)
+        # Espelho de fail_on_resolution para o sinal de RECALL (2026-10-29):
+        # sem este atributo, `_flag_recall_shortfall` não tinha como escalar
+        # para FAIL e o gate não podia bloquear por recall, por construção.
+        self.fail_on_recall = bool(fail_on_recall)
         # G1 FIX (2026-08-31): pca_iterations=30 como default (o knob vem do
         # preset dataset_default.json). O motor é agnóstico — o knob é do
         # chamador. 30 converge o subespaço dominante (subspace sim=1.0 vs 200,
@@ -748,9 +773,9 @@ class QualityValidator:
         the applied route is pool_only with measured seed recall below the
         floor, or pool_only with material recall loss, flag it so the operator
         SEES that the returned top-K is not the global top-K (the silent
-        collapse). Severity is always WARN — the code does NOT decide to block
-        or reverse; that policy belongs to the config (route_rules /
-        recall_floor / fail thresholds).
+        collapse). Severity is WARN by default and FAIL when
+        `fail_on_recall` is set — espelhando `fail_on_resolution`. A decisão de
+        bloquear é do config; o default preserva o comportamento histórico.
         """
         if mean_recall != mean_recall:      # nan → search_exact unavailable
             return
@@ -769,7 +794,11 @@ class QualityValidator:
                "the returned top-K is the best WITHIN the pool, NOT proven the "
                "global top-K. viol=0 does not cover this (silent collapse). "
                "For a global guarantee use audit_exhaustive=True or k1=N.")
-        report.add(Flag(F_RECALL, WARN, msg, metric=mean_recall,
+        # Só uma perda MATERIAL de recall bloqueia: abaixo do piso. O caso
+        # pool_only com recall < 1.0 mas >= piso continua WARN mesmo com
+        # fail_on_recall — bloquear aí seria bloquear o default do motor.
+        sev = FAIL if (below and getattr(self, "fail_on_recall", False)) else WARN
+        report.add(Flag(F_RECALL, sev, msg, metric=mean_recall,
                         threshold=recall_floor))
 
     def validate(self, corpus, dim: Optional[int] = None, *,
@@ -1149,6 +1178,7 @@ def audit_corpus(corpus, dim: Optional[int] = None, *,
         n_seed_queries=n_seed_queries or qc.n_seed_queries,
         probe_pca=qc.probe_pca if probe_pca is None else probe_pca,
         fail_on_resolution=qc.fail_on_resolution,
+        fail_on_recall=qc.fail_on_recall,
         engine_kwargs=preset_engine,
         pca_iterations=int(preset_engine.get("pca_iterations", 30)),
         nan_policy=qc.nan_policy,
