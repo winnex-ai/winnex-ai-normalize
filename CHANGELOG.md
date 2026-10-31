@@ -5,6 +5,65 @@ All notable changes to `winnex-ai-normalize` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.6] — 2026-10-30
+
+### Added: `certifiable` — o roteador garante a config, mas não a prova
+
+O roteador respondia *"qual config dá mais cobertura"*, não a pergunta do
+chamador: *"o motor que vou construir consegue **provar** o descarte?"*.
+
+Medido, com o roteador no comando:
+
+| corpus | roteia | avisa? | `has_fail` | cobertura real |
+|---|---|---|---:|---:|
+| isotrópico d=384 | `random s1=64` | sim | **False** | **0,00%** |
+| isotrópico d=1536 | `random s1=64` | sim | **False** | **0,00%** |
+| baixo posto r=16 | `pca s1=192` | não | False | 99,96% |
+| baixo posto r=200 | `pca s1=192` | não | False | 99,96% |
+
+Nas duas primeiras linhas o engine devolve **recall 1.000** com **0% de
+cobertura de exclusão**. Os quatro relatórios parecem auditoria bem-sucedida;
+só dois são certificáveis, e o chamador não tinha como pedir a diferença —
+nem campo no `QualityReport`, nem knob no `QualityConfig`.
+
+Campos novos:
+
+- `QualityReport.certifiable: bool` — a config roteada pode provar exclusão?
+- `QualityReport.certification_action: str` — por que não, e o que fazer
+  (vazio quando pode). Nomeia as saídas concretas: `audit_exhaustive=True`,
+  `basis='pca_corpus'`, ou aceitar um selo `pool_only`.
+- Ambos expostos em `to_dict()` e no `summary()` (`certifiable=NO`).
+
+O sinal já existia — `bound_fraction_pca` é a própria sonda do bound. Derivar
+o booleano dele transforma um WARN que o chamador talvez não leia num campo
+que ele tem de tratar. O limiar usa `_FOLD_BOUND_FRAC` (0,50), o mesmo que a
+tabela de rotas já usa para "corpus fortemente dobrável", então o booleano e o
+roteamento concordam **por construção**, em vez de virarem duas heurísticas
+divergentes.
+
+### Added: `QualityConfig.require_certifiable`
+
+Quando `True`, `build_quality_engine` levanta `_CertificationRequired` se a
+config roteada não é certificável. **Default `False`** — o top-K exato é
+devolvido de qualquer forma e a maioria dos callers não assina selo.
+
+É distinto de `fail_on_recall`:
+
+| knob | guarda | pergunta |
+|---|---|---|
+| `fail_on_recall` | a resposta | o top-K devolvido é o global? |
+| `require_certifiable` | o selo | o selo prova algo sobre o descarte? |
+
+Um config pode ter `recall = 1.0` e `cobertura = 0.0` — exatamente o caso do
+corpus isotrópico, que nada na stack detectava antes.
+
+### Tests
+
+6 testes novos em `tests/test_certifiable_2026_10_30.py`: corpus dobrável →
+`True`; isotrópico → `False` **com** ação; `to_dict` expõe; o knob bloqueia o
+não-certificável e permite o dobrável; e a distinção entre os dois knobs.
+Suíte: **61 passed** (55 anteriores + 6 novos).
+
 ## [1.4.5] — 2026-10-29
 
 ### Fixed: `stage1_dim` do preset não era clampado em `d`
