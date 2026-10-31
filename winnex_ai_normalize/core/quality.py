@@ -186,11 +186,24 @@ F_GT_PROX = "integrity.query_corpus_proximity"  # query index collides with corp
 F_RECALL = "dataset.recall_not_guaranteed"  # top-K is pool_only / recall<floor:
                                             # the returned top-K is NOT the
                                             # global top-K (silent collapse)
+F_CERTIFIABLE = "dataset.not_certifiable"   # the routed config cannot PROVE
+                                            # exclusion: it returns the right
+                                            # answer and attests nothing about
+                                            # what it left out. Distinct from
+                                            # F_RECALL: a config can have
+                                            # recall 1.0 and coverage 0.0.
 
 # Defaults (calibrated against the engine's measured proof coverage).
 _FOLD_BOUND_FRAC = 0.50     # bound_frac ≥ this → strongly foldable
 _FOLD_BOUND_FRAC_LOW = 0.20  # bound_frac below this → probe/fold gate
 _RESOLUTION_GAP_WARN = 0.10  # top1-topK cos gap below this → weak embedding
+# Minimum proof coverage for the routed config to count as certifiable
+# (2026-10-30). Calibrated on the two regimes the router distinguishes:
+#   isotropic 8000x384 → routed random/s1=64 → 0.000  (not certifiable)
+#   low-rank 8000x384  → routed pca/s1=192  → 0.998  (certifiable)
+# 0.50 matches _FOLD_BOUND_FRAC, the threshold the route table already uses to
+# call a corpus "strongly foldable", so the boolean and the routing agree.
+_CERT_COVERAGE_MIN = _FOLD_BOUND_FRAC
 # RECALL VALIDATION (2026-09-04, the honest-scope fix): the router used to
 # decide by bound COVERAGE alone (pruned_by_bound/N). A config can have high
 # proof coverage yet pool_only recall < 1.0 (measured: word2vec-like weak
@@ -300,6 +313,20 @@ class QualityConfig:
     # Default False preserva o comportamento atual; ligue para ter piso duro
     # de recall, espelhando o que `fail_on_resolution` já faz.
     fail_on_recall: bool = False
+
+    # REQUIRE A CERTIFICATE THAT PROVES SOMETHING (2026-10-30).
+    #
+    # `fail_on_recall` guards the ANSWER (is the top-K the global one?).
+    # This guards the SEAL (does the seal prove anything about what was left
+    # out?). They are different failures and the stack was only watching the
+    # first: a config can return recall 1.0 and coverage 0.0 — the answer is
+    # right, the certificate attests nothing. Measured on an isotropic
+    # 8000x384 corpus: routed random/s1=64, recall 1.000, coverage 0.00%.
+    #
+    # When True, build_quality_engine raises QualityGateError if the routed
+    # config is not certifiable. Off by default: the exact top-K comes back
+    # either way, and most callers do not sign a seal.
+    require_certifiable: bool = False
 
     # Stage-1 probe dimensions (2026-09-04): the dimensions the QUALITY
     # VALIDATOR uses to MEASURE the corpus signals (bound coverage under a
@@ -418,6 +445,23 @@ class QualityReport:
     # to be outside the top-K, for each seed query. Deterministic.
     excluded_seed_set: list = field(default_factory=list)
 
+    # CAN THE SUGGESTED CONFIG ACTUALLY CERTIFY? (2026-10-30)
+    #
+    # The router chose a config. That is not the same as the config being able
+    # to PROVE anything. Measured on an isotropic corpus (8000 x 384): the
+    # router picks `random / s1=64 / k1=0.2`, emits a `dataset.foldable: warn`,
+    # and the engine built with exactly that config has **0.00%** exclusion
+    # coverage — it returns the right answer and proves nothing about what it
+    # left out. On a low-rank corpus it picks `pca_corpus / s1=192` and gets
+    # 99.96%.
+    #
+    # Before this field, a caller had to read a WARN message and infer the
+    # consequence. `certifiable` says it as a boolean, and
+    # `certification_action` says what to do about it.
+    certifiable: bool = False
+    # Why, and what to do. Empty when certifiable.
+    certification_action: str = ""
+
     # Suggested engine config (what build_quality_engine applies)
     basis: str = "random"
     k1_fraction: float = 0.05
@@ -473,6 +517,9 @@ class QualityReport:
             "query_resolution": [dict(g) for g in self.query_resolution],
             "nan_fraction": round(float(self.metrics.get("nan_fraction", 0.0)), 8),
             "verdict": "fail" if self.has_fail else "warn" if self.warn_flags else "pass",
+            # The caller's actual question, answered as a boolean (2026-10-30).
+            "certifiable": self.certifiable,
+            "certification_action": self.certification_action,
         }
 
     def summary(self) -> str:
@@ -487,7 +534,8 @@ class QualityReport:
                 f"proof={self.metrics.get('proof_ratio', float('nan')):.2f} "
                 f"bound_frac={self.metrics.get('bound_fraction', float('nan')):.2f} "
                 f"prefilter={self.metrics.get('prefilter_fraction', float('nan')):.2f} "
-                f"excluded_seed={len(self.excluded_seed_set)}")
+                f"excluded_seed={len(self.excluded_seed_set)} | "
+                f"certifiable={'YES' if self.certifiable else 'NO'}")
 
 
 class QualityGateError(Exception):
@@ -497,6 +545,24 @@ class QualityGateError(Exception):
         self.report = report
         fails = "; ".join(f"{f.code}: {f.message}" for f in report.fail_flags)
         super().__init__(f"quality gate FAILED — {fails}")
+
+
+class _CertificationRequired(QualityGateError):
+    """Raised when cfg.require_certifiable=True and the routed config cannot
+    prove exclusion (2026-10-30).
+
+    Carries the same `.report`, and its message names the action, because the
+    failure mode it guards against is a caller who never learned that the
+    engine was returning an uncertifiable answer.
+    """
+
+    def __init__(self, report: "QualityReport"):
+        Exception.__init__(
+            self,
+            "certificate required but the routed config cannot prove "
+            "exclusion — " + (report.certification_action or
+                              "see report.certification_action"))
+        self.report = report
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1210,56 @@ class QualityValidator:
                                     route=report.basis)
 
         report.excluded_seed_set = captured
+
+        # 5) CAN THE ROUTED CONFIG CERTIFY? (2026-10-30)
+        #
+        # The router's job so far ended at "which config gives the most proof
+        # coverage". That is not the caller's question. The caller asks: "will
+        # the engine I am about to build be able to PROVE that what it left out
+        # was out?" — and the answer is sometimes no, silently.
+        #
+        # Measured (2026-10-30): an isotropic 8000 x 384 corpus routes to
+        # `random / s1=64 / k1=0.2`, gets a `dataset.foldable: warn`, and
+        # yields **0.00%** exclusion coverage. A low-rank corpus routes to
+        # `pca_corpus / s1=192` and yields **99.96%**. Both emit a report that
+        # looks like a successful audit. Only one of them is certifiable.
+        #
+        # The signal is already computed — `bound_fraction_pca` is the bound's
+        # own probe of what a PCA basis can prove. Deriving the boolean from it
+        # turns a WARN the caller may not read into a field the caller must
+        # handle.
+        _bf_pca = float(report.metrics.get("bound_fraction_pca", 0.0) or 0.0)
+        _bf_rand = float(report.metrics.get("bound_fraction", 0.0) or 0.0)
+        if report.basis == "pca_corpus":
+            report.certifiable = _bf_pca >= _CERT_COVERAGE_MIN
+        else:
+            # A random basis can certify only when its own coverage clears the
+            # bar — which in practice means s1 close to d.
+            report.certifiable = _bf_rand >= _CERT_COVERAGE_MIN
+        if not report.certifiable:
+            best = max(_bf_pca, _bf_rand)
+            pct = 100.0 * max(0.0, best)
+            report.certification_action = (
+                f"the routed config ({report.basis}, stage1_dim="
+                f"{report.stage1_dim}) proves {pct:.1f}% exclusion coverage "
+                f"(< {100 * _CERT_COVERAGE_MIN:.0f}% required). "
+                + (
+                    "The corpus is foldable by PCA — pass audit_exhaustive=True "
+                    "for an exact_global certificate, or rebuild the engine "
+                    "with basis='pca_corpus' at the routed rank."
+                    if _bf_pca >= _CERT_COVERAGE_MIN
+                    else "No projection of this corpus proves useful exclusion. "
+                    "The engine will still return the exact top-K, but the "
+                    "certificate can only attest 'pool_only' for it. Choose "
+                    "audit_exhaustive=True (exact, O(N*d)) if a global "
+                    "certificate is required, or accept a pool-scoped seal."
+                ))
+            report.add(Flag(
+                F_CERTIFIABLE, WARN,
+                f"the routed config cannot certify exclusion: "
+                f"bound_fraction={_bf_rand:.3f}, bound_fraction_pca={_bf_pca:.3f} "
+                f"(< {_CERT_COVERAGE_MIN}). See certification_action.",
+                metric=max(_bf_rand, _bf_pca), threshold=_CERT_COVERAGE_MIN))
         return report
 
 
@@ -1231,6 +1347,19 @@ def build_quality_engine(corpus, dim=None, *, k=10, reference=None,
                           k=k, cfg=cfg)
     if report.has_fail and not allow_unsafe:
         raise QualityGateError(report)
+
+    # CERTIFICATION POLICY (2026-10-30) — the knob that lets the caller say
+    # "I need the seal to prove something", instead of reading a WARN and
+    # hoping. Before this, a caller that required a certificate had no way to
+    # ask for one: the router returned a config with 0% coverage and the build
+    # succeeded. Measured: isotropic corpus -> routed random/s1=64 -> 0.00%
+    # coverage, no exception, no non-warning signal.
+    #
+    # Not a default: the exact top-K is returned either way, and most callers
+    # do not need a seal. Opt-in keeps the gate honest without breaking the
+    # common path.
+    if getattr(cfg, "require_certifiable", False) and not report.certifiable:
+        raise _CertificationRequired(report)
 
     # engine_kwargs: mescla o preset do dataset (cfg.engine_kwargs, do JSON) com
     # os overrides explícitos do chamador (engine_kwargs param). O motor é
